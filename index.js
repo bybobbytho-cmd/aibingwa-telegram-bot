@@ -1,69 +1,144 @@
 import "dotenv/config";
 import { Bot } from "grammy";
 import { AgentBingwa } from "@0xMgwan/aibingwa-agent";
+import { searchMarkets, formatMarkets } from "./src/polymarket.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
-if (!token) throw new Error("Missing TELEGRAM_BOT_TOKEN");
+if (!token) throw new Error("Missing TELEGRAM_BOT_TOKEN in environment");
 
 const bot = new Bot(token);
 
-// --- Read Railway/.env vars ---
-const AI_ENABLED = String(process.env.AI_ENABLED || "false").toLowerCase() === "true";
-const AI_PROVIDER = (process.env.AI_PROVIDER || "anthropic").toLowerCase(); // anthropic | openai | gemini
-const AI_MODEL = process.env.AI_MODEL || "claude-3-5-sonnet-20241022";
-const MODE = process.env.MODE || "SIMULATION";
+// ---------- ENV / FLAGS ----------
+const MODE = (process.env.MODE || "SIMULATION").toUpperCase(); // SIMULATION | LIVE (later)
+const SIM_MODE = (process.env.SIM_MODE || "ON").toUpperCase(); // ON | OFF
+const SIM_CASH = Number(process.env.SIM_CASH || 50);
 
-function mask(val) {
-  return val ? "SET ✅" : "NOT SET ❌";
+const AI_ENABLED = String(process.env.AI_ENABLED || "off").toLowerCase() === "on";
+const AI_PROVIDER = (process.env.AI_PROVIDER || "gemini").toLowerCase();
+const AI_MODEL = process.env.AI_MODEL || "gemini-1.5-flash";
+
+// Keys (only used if AI is enabled OR specific integrations are used)
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const BANKR_API_KEY = process.env.BANKR_API_KEY;
+
+// ---------- HELPERS ----------
+function yesNo(v) {
+  return v ? "SET ✅" : "NOT SET ❌";
 }
 
-// --- Create agent only if AI is enabled ---
-let agent = null;
-
-if (AI_ENABLED) {
-  agent = new AgentBingwa({
-    // Provider selection (the agent package should pick based on provider/model)
-    provider: AI_PROVIDER,
-    model: AI_MODEL,
-
-    // Keys (only one needs to be valid for the chosen provider)
-    anthropicApiKey: process.env.ANTHROPIC_API_KEY,
-    openaiApiKey: process.env.OPENAI_API_KEY,
-    geminiApiKey: process.env.GEMINI_API_KEY,
-
-    // Other integrations
-    bankrApiKey: process.env.BANKR_API_KEY,
-  });
+function statusText() {
+  return [
+    `Status ✅`,
+    `AI: ${AI_ENABLED ? "on ✅" : "off"}`,
+    `Provider: ${AI_PROVIDER}`,
+    `Model: ${AI_MODEL}`,
+    `Mode: ${MODE}`,
+    `Simulation: ${SIM_MODE} (cash: $${SIM_CASH})`,
+    `Keys:`,
+    `- Bankr: ${yesNo(BANKR_API_KEY)}`,
+    `- Anthropic: ${yesNo(ANTHROPIC_API_KEY)}`,
+    `- OpenAI: ${yesNo(OPENAI_API_KEY)}`,
+    `- Gemini: ${yesNo(GEMINI_API_KEY)}`,
+  ].join("\n");
 }
 
-// --- Commands ---
-bot.command("start", (ctx) => ctx.reply("Bot is live ✅"));
+function aiIsConfigured() {
+  if (!AI_ENABLED) return { ok: false, reason: "AI is OFF" };
 
-bot.command("status", (ctx) => {
-  ctx.reply(
-`Status ✅
-AI: ${AI_ENABLED ? "on" : "off"}
-Provider: ${AI_PROVIDER}
-Model: ${AI_MODEL}
-Mode: ${MODE}
-Keys:
-- Bankr: ${mask(process.env.BANKR_API_KEY)}
-- Anthropic: ${mask(process.env.ANTHROPIC_API_KEY)}
-- OpenAI: ${mask(process.env.OPENAI_API_KEY)}
-- Gemini: ${mask(process.env.GEMINI_API_KEY)}`
+  if (AI_PROVIDER === "claude" && !ANTHROPIC_API_KEY)
+    return { ok: false, reason: "ANTHROPIC_API_KEY missing" };
+
+  if (AI_PROVIDER === "openai" && !OPENAI_API_KEY)
+    return { ok: false, reason: "OPENAI_API_KEY missing" };
+
+  if (AI_PROVIDER === "gemini" && !GEMINI_API_KEY)
+    return { ok: false, reason: "GEMINI_API_KEY missing" };
+
+  return { ok: true };
+}
+
+// ---------- AGENT (only used when AI ON) ----------
+const agent = new AgentBingwa({
+  anthropicApiKey: ANTHROPIC_API_KEY,
+  openaiApiKey: OPENAI_API_KEY,
+  geminiApiKey: GEMINI_API_KEY,
+  provider: AI_PROVIDER, // "claude" | "openai" | "gemini"
+  model: AI_MODEL,
+  bankrApiKey: BANKR_API_KEY,
+  mode: MODE, // SIMULATION for now
+});
+
+// ---------- COMMANDS ----------
+bot.command("start", async (ctx) => {
+  await ctx.reply(
+    [
+      `Bot is live ✅`,
+      `AI: ${AI_ENABLED ? "on ✅" : "off"}`,
+      `Mode: ${MODE}`,
+      `Bankr key set: ${BANKR_API_KEY ? "✅" : "❌"}`,
+    ].join("\n")
   );
 });
 
-bot.command("ping", (ctx) => ctx.reply("Pong 🏓 (no AI used)"));
+bot.command("status", async (ctx) => {
+  await ctx.reply(statusText());
+});
 
-// --- Message handling ---
-bot.on("message:text", async (ctx) => {
-  // HARD STOP: AI is disabled → never call any provider
-  if (!AI_ENABLED) {
-    return ctx.reply("🧪 Simulation is ON. AI is OFF.\nUse /status.");
+// /markets <query>
+// Example: /markets bitcoin
+bot.command("markets", async (ctx) => {
+  const text = ctx.message?.text || "";
+  const query = text.replace("/markets", "").trim();
+
+  if (!query) {
+    return ctx.reply("Usage: /markets <keyword>\nExample: /markets bitcoin");
   }
 
-  // AI path
+  try {
+    const markets = await searchMarkets(query, 5);
+    const msg = formatMarkets(markets);
+    await ctx.reply(msg);
+  } catch (err) {
+    await ctx.reply(`Polymarket fetch error ❌\n${String(err?.message || err)}`);
+  }
+});
+
+// /market <query> (same as /markets but returns fewer lines if you want later)
+bot.command("market", async (ctx) => {
+  const text = ctx.message?.text || "";
+  const query = text.replace("/market", "").trim();
+
+  if (!query) {
+    return ctx.reply("Usage: /market <keyword>\nExample: /market bitcoin");
+  }
+
+  try {
+    const markets = await searchMarkets(query, 3);
+    const msg = formatMarkets(markets);
+    await ctx.reply(msg);
+  } catch (err) {
+    await ctx.reply(`Polymarket fetch error ❌\n${String(err?.message || err)}`);
+  }
+});
+
+// /ping
+bot.command("ping", async (ctx) => {
+  await ctx.reply("Pong ✅");
+});
+
+// ---------- TEXT MESSAGES ----------
+bot.on("message:text", async (ctx) => {
+  // If user is chatting normally, only use AI if enabled & configured.
+  const cfg = aiIsConfigured();
+  if (!cfg.ok) {
+    // Don’t crash; keep it friendly.
+    return ctx.reply(
+      `🧪 Simulation is ON. AI is OFF.\nUse /markets bitcoin to fetch data.\nUse /status to confirm settings.`
+    );
+  }
+
   try {
     const reply = await agent.processMessage(
       String(ctx.chat.id),
@@ -72,10 +147,10 @@ bot.on("message:text", async (ctx) => {
     );
     await ctx.reply(reply);
   } catch (err) {
-    console.error(err);
-    await ctx.reply("⚠️ AI error. Check Railway logs.");
+    await ctx.reply(`Hmm, my brain glitched 🤔 Error: ${String(err?.message || err)}`);
   }
 });
 
+// ---------- START ----------
 bot.start();
 console.log("Bot running ✅");

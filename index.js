@@ -11,12 +11,12 @@ import {
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) throw new Error("Missing TELEGRAM_BOT_TOKEN");
 
-// ---- Runtime flags (DATA FIRST) ----
+// Flags (DATA FIRST)
 const AI_ENABLED = String(process.env.AI_ENABLED || "false").toLowerCase() === "true";
 const AI_MODEL = process.env.AI_MODEL || "unset";
-const MODE = String(process.env.MODE || "SIM").toUpperCase(); // SIM / REAL (REAL later)
+const MODE = String(process.env.MODE || "SIM").toUpperCase(); // SIM / REAL later
 
-// Identify instance (helps debug 409 conflicts)
+// Helps detect “multiple Railway instances”
 const INSTANCE =
   process.env.RAILWAY_REPLICA_ID ||
   process.env.RAILWAY_SERVICE_ID ||
@@ -45,20 +45,18 @@ function helpText() {
   ].join("\n");
 }
 
-// --- IMPORTANT: clear webhook from Railway (so polling can work) ---
+// IMPORTANT: Clear webhook on Railway startup so long polling works (prevents 409 conflicts)
 async function ensurePollingMode() {
   const base = `https://api.telegram.org/bot${token}`;
 
-  // 1) Delete webhook
   try {
     const del = await fetch(`${base}/setWebhook?url=`, { method: "GET" });
     const delJson = await del.json().catch(() => null);
-    console.log("Telegram setWebhook?url= (delete webhook) =>", delJson || { ok: false });
+    console.log("Telegram setWebhook?url= =>", delJson || { ok: false });
   } catch (e) {
-    console.log("Telegram webhook delete failed (network). Polling may still conflict:", e?.message || e);
+    console.log("Webhook delete failed (network):", e?.message || e);
   }
 
-  // 2) Confirm webhook info
   try {
     const info = await fetch(`${base}/getWebhookInfo`, { method: "GET" });
     const infoJson = await info.json().catch(() => null);
@@ -71,7 +69,7 @@ async function ensurePollingMode() {
       console.log("✅ Webhook cleared. Polling should work.");
     }
   } catch (e) {
-    console.log("Telegram getWebhookInfo failed (network). Continuing anyway:", e?.message || e);
+    console.log("getWebhookInfo failed (network):", e?.message || e);
   }
 }
 
@@ -89,7 +87,7 @@ bot.command("status", async (ctx) => {
       `Instance: ${INSTANCE}`,
       "",
       "Data source: Gamma API (public)",
-      "Polling: ON (webhook is cleared at startup)",
+      "Polling: ON (webhook cleared at startup)",
     ].join("\n"),
   );
 });
@@ -113,15 +111,13 @@ bot.command("markets", async (ctx) => {
   await ctx.reply("🔎 Fetching LIVE markets from Polymarket (Gamma API)...");
 
   try {
-    let markets = [];
-
     if (query.toLowerCase() === "trending") {
-      markets = await getTrendingActiveMarkets({ limit: 10 });
+      const markets = await getTrendingActiveMarkets({ limit: 10 });
       await ctx.reply(formatMarketListMessage("trending", markets));
       return;
     }
 
-    markets = await searchActiveMarkets(query, { limit: 10 });
+    const markets = await searchActiveMarkets(query, { limit: 10 });
 
     if (!markets.length) {
       await ctx.reply(`No active markets found for: ${query}`);
@@ -190,7 +186,6 @@ bot.catch((err) => {
 
 console.log("Boot ✅", { MODE, AI_ENABLED, AI_MODEL, INSTANCE });
 
-// IMPORTANT: clear webhook first, then start polling
 await ensurePollingMode();
 
 console.log("Bot running ✅ (polling)", { INSTANCE });

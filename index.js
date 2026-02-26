@@ -1,54 +1,197 @@
 import "dotenv/config";
 import { Bot } from "grammy";
-import { fetchMarkets, formatMarketsResult } from "./src/polymarket.js";
+import {
+  searchActiveMarkets,
+  getTrendingActiveMarkets,
+  findBestUpDownMarket,
+  formatMarketListMessage,
+  formatUpDownMessage,
+} from "./src/polymarket.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) throw new Error("Missing TELEGRAM_BOT_TOKEN");
 
+// ---- Runtime flags (DATA FIRST) ----
+const AI_ENABLED = String(process.env.AI_ENABLED || "false").toLowerCase() === "true";
+const AI_MODEL = process.env.AI_MODEL || "unset";
+const MODE = String(process.env.MODE || "SIM").toUpperCase(); // SIM / REAL (REAL later)
+
+// Identify instance (helps debug 409 conflicts)
+const INSTANCE =
+  process.env.RAILWAY_REPLICA_ID ||
+  process.env.RAILWAY_SERVICE_ID ||
+  process.env.HOSTNAME ||
+  "unknown";
+
 const bot = new Bot(token);
 
-bot.catch((err) => {
-  console.error("BOT_ERROR:", err.error);
-});
+function helpText() {
+  return [
+    "Bot is live ✅",
+    "",
+    `Mode: ${MODE}`,
+    `AI: ${AI_ENABLED ? "on" : "off"}`,
+    `AI_MODEL: ${AI_MODEL}`,
+    `Instance: ${INSTANCE}`,
+    "",
+    "Commands:",
+    "• /status",
+    "• /markets bitcoin",
+    "• /markets eth",
+    "• /markets trending",
+    "• /updown btc 5m",
+    "• /updown btc 15m",
+    "• /updown btc 60m",
+  ].join("\n");
+}
 
-// Force-clear any webhook so polling works (runs on Railway)
-async function clearWebhook() {
+// --- IMPORTANT: clear webhook from Railway (so polling can work) ---
+async function ensurePollingMode() {
+  const base = `https://api.telegram.org/bot${token}`;
+
+  // 1) Delete webhook
   try {
-    const r = await fetch(`https://api.telegram.org/bot${token}/setWebhook`, {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: "url=",
-    });
-    const txt = await r.text();
-    console.log("Webhook cleared:", txt);
+    const del = await fetch(`${base}/setWebhook?url=`, { method: "GET" });
+    const delJson = await del.json().catch(() => null);
+    console.log("Telegram setWebhook?url= (delete webhook) =>", delJson || { ok: false });
   } catch (e) {
-    console.log("Webhook clear failed:", e?.message || e);
+    console.log("Telegram webhook delete failed (network). Polling may still conflict:", e?.message || e);
+  }
+
+  // 2) Confirm webhook info
+  try {
+    const info = await fetch(`${base}/getWebhookInfo`, { method: "GET" });
+    const infoJson = await info.json().catch(() => null);
+    console.log("Telegram getWebhookInfo =>", infoJson || { ok: false });
+
+    const url = infoJson?.result?.url;
+    if (typeof url === "string" && url.length > 0) {
+      console.log("⚠️ Webhook still set to:", url);
+    } else {
+      console.log("✅ Webhook cleared. Polling should work.");
+    }
+  } catch (e) {
+    console.log("Telegram getWebhookInfo failed (network). Continuing anyway:", e?.message || e);
   }
 }
 
 bot.command("start", async (ctx) => {
-  await ctx.reply("Bot is live ✅\nTry: /markets bitcoin\nUse: /status");
+  await ctx.reply(helpText());
 });
 
 bot.command("status", async (ctx) => {
-  const sim = process.env.SIMULATION_MODE === "true" ? "ON" : "OFF";
-  const aiEnabled = process.env.AI_ENABLED === "true" ? "ON" : "OFF";
-  const model = process.env.AI_MODEL || "none";
-  await ctx.reply(`🧪 Simulation: ${sim}\n🤖 AI: ${aiEnabled}\n🧠 Model: ${model}`);
+  await ctx.reply(
+    [
+      "📊 Status",
+      `Mode: ${MODE}`,
+      `AI: ${AI_ENABLED ? "on" : "off"}`,
+      `AI_MODEL: ${AI_MODEL}`,
+      `Instance: ${INSTANCE}`,
+      "",
+      "Data source: Gamma API (public)",
+      "Polling: ON (webhook is cleared at startup)",
+    ].join("\n"),
+  );
 });
 
 bot.command("markets", async (ctx) => {
+  const text = ctx.message?.text || "";
+  const parts = text.trim().split(/\s+/);
+  const queryRaw = parts.slice(1).join(" ").trim();
+
+  if (!queryRaw) {
+    await ctx.reply("Usage: /markets bitcoin  (or /markets eth /markets trending)");
+    return;
+  }
+
+  const qLower = queryRaw.toLowerCase();
+  const query =
+    qLower === "btc" ? "bitcoin" :
+    qLower === "eth" ? "ethereum" :
+    queryRaw;
+
+  await ctx.reply("🔎 Fetching LIVE markets from Polymarket (Gamma API)...");
+
   try {
-    const parts = ctx.message.text.split(" ");
-    const query = parts.slice(1).join(" ").trim() || "bitcoin";
-    const result = await fetchMarkets(query, 5);
-    const msg = formatMarketsResult(query, result);
-    await ctx.reply(msg);
+    let markets = [];
+
+    if (query.toLowerCase() === "trending") {
+      markets = await getTrendingActiveMarkets({ limit: 10 });
+      await ctx.reply(formatMarketListMessage("trending", markets));
+      return;
+    }
+
+    markets = await searchActiveMarkets(query, { limit: 10 });
+
+    if (!markets.length) {
+      await ctx.reply(`No active markets found for: ${query}`);
+      return;
+    }
+
+    await ctx.reply(formatMarketListMessage(query, markets));
   } catch (err) {
-    await ctx.reply(`❌ Error fetching markets: ${err.message}`);
+    console.error("markets error:", err);
+    await ctx.reply("⚠️ Failed to fetch markets. Check Railway logs for details.");
   }
 });
 
-await clearWebhook();
+bot.command("updown", async (ctx) => {
+  const text = ctx.message?.text || "";
+  const parts = text.trim().split(/\s+/);
+
+  const asset = (parts[1] || "").toLowerCase(); // btc, eth
+  const horizon = (parts[2] || "").toLowerCase(); // 5m, 15m, 60m
+
+  if (!asset || !horizon) {
+    await ctx.reply("Usage: /updown btc 5m  (also 15m, 60m)");
+    return;
+  }
+
+  if (!["btc", "eth", "bitcoin", "ethereum"].includes(asset)) {
+    await ctx.reply("Supported assets for now: btc, eth");
+    return;
+  }
+
+  if (!["5m", "15m", "60m"].includes(horizon)) {
+    await ctx.reply("Supported horizons: 5m, 15m, 60m");
+    return;
+  }
+
+  const normalizedAsset = asset === "bitcoin" ? "btc" : asset === "ethereum" ? "eth" : asset;
+
+  await ctx.reply("📈 Searching LIVE Up/Down market on Polymarket...");
+
+  try {
+    const result = await findBestUpDownMarket(normalizedAsset, horizon);
+
+    if (!result) {
+      await ctx.reply(
+        [
+          "No matching Up/Down market found right now.",
+          "Try:",
+          "• /markets bitcoin",
+          "• /markets eth",
+          "• /markets trending",
+        ].join("\n"),
+      );
+      return;
+    }
+
+    await ctx.reply(formatUpDownMessage(result, normalizedAsset, horizon));
+  } catch (err) {
+    console.error("updown error:", err);
+    await ctx.reply("⚠️ Failed to fetch Up/Down market. Check Railway logs for details.");
+  }
+});
+
+bot.catch((err) => {
+  console.error("bot error:", err);
+});
+
+console.log("Boot ✅", { MODE, AI_ENABLED, AI_MODEL, INSTANCE });
+
+// IMPORTANT: clear webhook first, then start polling
+await ensurePollingMode();
+
+console.log("Bot running ✅ (polling)", { INSTANCE });
 bot.start();
-console.log("Bot running ✅ IDX-GAMMA-LIVE");

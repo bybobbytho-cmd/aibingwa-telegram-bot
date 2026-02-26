@@ -41,27 +41,32 @@ function helpText() {
     "• /updown btc 5m",
     "• /updown btc 15m",
     "• /updown btc 60m",
+    "• /debug_poll (prints getUpdates result to Railway logs)",
   ].join("\n");
 }
 
-// Clears webhook so polling works
-async function ensurePollingMode() {
-  const base = `https://api.telegram.org/bot${token}`;
+async function tgGet(path) {
+  const url = `https://api.telegram.org/bot${token}/${path}`;
+  const res = await fetch(url, { method: "GET" });
+  const json = await res.json().catch(() => null);
+  if (!res.ok || !json?.ok) {
+    throw new Error(`Telegram API failed for ${path}: ${JSON.stringify(json).slice(0, 400)}`);
+  }
+  return json;
+}
 
+async function ensurePollingMode() {
   try {
-    const del = await fetch(`${base}/setWebhook?url=`, { method: "GET" });
-    const delJson = await del.json().catch(() => null);
-    console.log("Telegram setWebhook?url= =>", delJson || { ok: false });
+    const del = await tgGet("setWebhook?url=");
+    console.log("Telegram setWebhook?url= =>", del);
   } catch (e) {
     console.log("Webhook delete failed:", e?.message || e);
   }
 
   try {
-    const info = await fetch(`${base}/getWebhookInfo`, { method: "GET" });
-    const infoJson = await info.json().catch(() => null);
-    console.log("Telegram getWebhookInfo =>", infoJson || { ok: false });
-
-    const url = infoJson?.result?.url;
+    const info = await tgGet("getWebhookInfo");
+    console.log("Telegram getWebhookInfo =>", info);
+    const url = info?.result?.url;
     if (typeof url === "string" && url.length > 0) {
       console.log("⚠️ Webhook still set to:", url);
     } else {
@@ -72,7 +77,6 @@ async function ensurePollingMode() {
   }
 }
 
-// NEW: Confirm which bot this token belongs to (prints @username)
 async function logBotIdentity() {
   try {
     const me = await bot.api.getMe();
@@ -83,11 +87,11 @@ async function logBotIdentity() {
       instance: INSTANCE,
     });
   } catch (e) {
-    console.log("❌ getMe failed (token/network).", e?.message || e);
+    console.log("❌ getMe failed.", e?.message || e);
   }
 }
 
-// DEBUG: log any message that reaches Railway
+// DEBUG: log anything that reaches grammy
 bot.on("message", async (ctx) => {
   const msg = ctx.message;
   console.log("INCOMING MESSAGE ✅", {
@@ -101,17 +105,14 @@ bot.on("message", async (ctx) => {
 });
 
 bot.command("start", async (ctx) => {
-  console.log("COMMAND /start ✅");
   await ctx.reply(helpText());
 });
 
 bot.command("ping", async (ctx) => {
-  console.log("COMMAND /ping ✅");
   await ctx.reply("pong ✅");
 });
 
 bot.command("status", async (ctx) => {
-  console.log("COMMAND /status ✅");
   await ctx.reply(
     [
       "📊 Status",
@@ -126,8 +127,29 @@ bot.command("status", async (ctx) => {
   );
 });
 
+// NEW: direct Telegram getUpdates probe (prints to Railway logs)
+bot.command("debug_poll", async (ctx) => {
+  await ctx.reply("🧪 Running getUpdates probe… check Railway logs.");
+
+  try {
+    const r = await tgGet("getUpdates?limit=5&timeout=0");
+    // Print only summaries (avoid huge logs)
+    const summaries = (r.result || []).map((u) => ({
+      update_id: u.update_id,
+      message_text: u.message?.text,
+      chat_id: u.message?.chat?.id,
+      from_username: u.message?.from?.username,
+    }));
+    console.log("DEBUG getUpdates =>", { count: summaries.length, summaries });
+
+    await ctx.reply(`✅ getUpdates returned ${summaries.length} updates (see Railway logs).`);
+  } catch (e) {
+    console.log("DEBUG getUpdates failed =>", e?.message || e);
+    await ctx.reply("❌ getUpdates probe failed. Check Railway logs.");
+  }
+});
+
 bot.command("markets", async (ctx) => {
-  console.log("COMMAND /markets ✅", { text: ctx.message?.text });
   const text = ctx.message?.text || "";
   const parts = text.trim().split(/\s+/);
   const queryRaw = parts.slice(1).join(" ").trim();
@@ -138,10 +160,7 @@ bot.command("markets", async (ctx) => {
   }
 
   const qLower = queryRaw.toLowerCase();
-  const query =
-    qLower === "btc" ? "bitcoin" :
-    qLower === "eth" ? "ethereum" :
-    queryRaw;
+  const query = qLower === "btc" ? "bitcoin" : qLower === "eth" ? "ethereum" : queryRaw;
 
   await ctx.reply("🔎 Fetching LIVE markets from Polymarket (Gamma API)...");
 
@@ -166,7 +185,6 @@ bot.command("markets", async (ctx) => {
 });
 
 bot.command("updown", async (ctx) => {
-  console.log("COMMAND /updown ✅", { text: ctx.message?.text });
   const text = ctx.message?.text || "";
   const parts = text.trim().split(/\s+/);
 
@@ -216,3 +234,5 @@ await logBotIdentity();
 
 console.log("Bot running ✅ (polling)", { INSTANCE });
 bot.start();
+
+

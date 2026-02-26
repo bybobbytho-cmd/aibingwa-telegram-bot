@@ -44,6 +44,7 @@ function helpText() {
   ].join("\n");
 }
 
+// Clears webhook so polling works
 async function ensurePollingMode() {
   const base = `https://api.telegram.org/bot${token}`;
 
@@ -52,7 +53,7 @@ async function ensurePollingMode() {
     const delJson = await del.json().catch(() => null);
     console.log("Telegram setWebhook?url= =>", delJson || { ok: false });
   } catch (e) {
-    console.log("Webhook delete failed (network):", e?.message || e);
+    console.log("Webhook delete failed:", e?.message || e);
   }
 
   try {
@@ -67,37 +68,38 @@ async function ensurePollingMode() {
       console.log("✅ Webhook cleared. Polling should work.");
     }
   } catch (e) {
-    console.log("getWebhookInfo failed (network):", e?.message || e);
+    console.log("getWebhookInfo failed:", e?.message || e);
   }
 }
 
-// ---- DEBUG: log every message/update that reaches the bot ----
+// NEW: Confirm which bot this token belongs to (prints @username)
+async function logBotIdentity() {
+  try {
+    const me = await bot.api.getMe();
+    console.log("✅ TOKEN BOT IDENTITY =>", {
+      id: me.id,
+      username: me.username,
+      first_name: me.first_name,
+      instance: INSTANCE,
+    });
+  } catch (e) {
+    console.log("❌ getMe failed (token/network).", e?.message || e);
+  }
+}
+
+// DEBUG: log any message that reaches Railway
 bot.on("message", async (ctx) => {
   const msg = ctx.message;
-  const from = msg?.from;
-  const chat = msg?.chat;
-
-  const text = msg?.text || "";
   console.log("INCOMING MESSAGE ✅", {
     instance: INSTANCE,
-    chat_id: chat?.id,
-    chat_type: chat?.type,
-    from_id: from?.id,
-    from_username: from?.username,
-    text,
-    date: msg?.date,
+    chat_id: msg?.chat?.id,
+    chat_type: msg?.chat?.type,
+    from_id: msg?.from?.id,
+    from_username: msg?.from?.username,
+    text: msg?.text || "",
   });
 });
 
-bot.on("callback_query:data", async (ctx) => {
-  console.log("INCOMING CALLBACK ✅", {
-    instance: INSTANCE,
-    from_id: ctx.from?.id,
-    data: ctx.callbackQuery?.data,
-  });
-});
-
-// ---- Commands ----
 bot.command("start", async (ctx) => {
   console.log("COMMAND /start ✅");
   await ctx.reply(helpText());
@@ -151,7 +153,6 @@ bot.command("markets", async (ctx) => {
     }
 
     const markets = await searchActiveMarkets(query, { limit: 10 });
-
     if (!markets.length) {
       await ctx.reply(`No active markets found for: ${query}`);
       return;
@@ -193,20 +194,10 @@ bot.command("updown", async (ctx) => {
 
   try {
     const result = await findBestUpDownMarket(normalizedAsset, horizon);
-
     if (!result) {
-      await ctx.reply(
-        [
-          "No matching Up/Down market found right now.",
-          "Try:",
-          "• /markets bitcoin",
-          "• /markets eth",
-          "• /markets trending",
-        ].join("\n"),
-      );
+      await ctx.reply("No matching Up/Down market found right now. Try /markets bitcoin");
       return;
     }
-
     await ctx.reply(formatUpDownMessage(result, normalizedAsset, horizon));
   } catch (err) {
     console.error("updown error:", err);
@@ -221,6 +212,7 @@ bot.catch((err) => {
 console.log("Boot ✅", { MODE, AI_ENABLED, AI_MODEL, INSTANCE });
 
 await ensurePollingMode();
+await logBotIdentity();
 
 console.log("Bot running ✅ (polling)", { INSTANCE });
 bot.start();

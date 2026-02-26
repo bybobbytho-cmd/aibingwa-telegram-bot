@@ -24,17 +24,15 @@ const KEYS = {
   gemini: keyOn("GEMINI_API_KEY") || keyOn("GOOGLE_API_KEY"),
 };
 
-const INSTANCE =
-  process.env.RAILWAY_REPLICA_ID ||
-  process.env.RAILWAY_SERVICE_ID ||
-  process.env.HOSTNAME ||
-  "unknown";
-
 const bot = new Bot(token);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * IMPORTANT: This MUST be a string template (backticks).
+ * If the backticks go missing, Railway will crash exactly like your logs.
+ */
 async function tgGet(path) {
-  const url = https://api.telegram.org/bot${token}/${path};
+  const url = `https://api.telegram.org/bot${token}/${path}`;
   const res = await fetch(url);
   const json = await res.json().catch(() => null);
   return { status: res.status, json };
@@ -47,21 +45,9 @@ async function ensurePollingMode() {
   const info = await tgGet("getWebhookInfo");
   console.log("Telegram getWebhookInfo =>", info?.json || info);
 
-  const url = info?.json?.result?.url;
-  if (typeof url === "string" && url.length === 0) console.log("✅ Webhook cleared. Polling should work.");
-}
-
-async function logIdentity() {
-  try {
-    const me = await bot.api.getMe();
-    console.log("✅ TOKEN BOT IDENTITY =>", {
-      id: me.id,
-      username: me.username,
-      first_name: me.first_name,
-      instance: INSTANCE,
-    });
-  } catch (e) {
-    console.log("❌ getMe failed:", e?.message || e);
+  const hookUrl = info?.json?.result?.url;
+  if (typeof hookUrl === "string" && hookUrl.length === 0) {
+    console.log("✅ Webhook cleared. Polling should work.");
   }
 }
 
@@ -69,31 +55,31 @@ async function logIdentity() {
 function statusCompact() {
   return [
     "📊 Status",
-    Simulation: ${SIM_ON ? "✅ ON" : "❌ OFF"}   Cash: $${SIM_START_CASH},
-    AI: ${AI_ENABLED ? "✅ ON" : "❌ OFF"}   Model: ${AI_MODEL},
+    `Simulation: ${SIM_ON ? "✅ ON" : "❌ OFF"}   Cash: $${SIM_START_CASH}`,
+    `AI: ${AI_ENABLED ? "✅ ON" : "❌ OFF"}   Model: ${AI_MODEL}`,
     "Data: Polymarket CLOB (public reads)",
   ].join("\n");
 }
 
 function statusDetails() {
   const keysLine = [
-    Telegram: ✅,
-    Bankr: ${KEYS.bankr ? "✅" : "❌"},
-    Anthropic: ${KEYS.anthropic ? "✅" : "❌"},
-    OpenAI: ${KEYS.openai ? "✅" : "❌"},
-    Gemini: ${KEYS.gemini ? "✅" : "❌"},
+    `Telegram: ✅`,
+    `Bankr: ${KEYS.bankr ? "✅" : "❌"}`,
+    `Anthropic: ${KEYS.anthropic ? "✅" : "❌"}`,
+    `OpenAI: ${KEYS.openai ? "✅" : "❌"}`,
+    `Gemini: ${KEYS.gemini ? "✅" : "❌"}`,
   ].join(" | ");
 
   return [
     "📊 Status (details)",
     "",
-    Simulation: ${SIM_ON ? "✅ ON" : "❌ OFF"},
-    Sim cash: $${SIM_START_CASH},
+    `Simulation: ${SIM_ON ? "✅ ON" : "❌ OFF"}`,
+    `Sim cash: $${SIM_START_CASH}`,
     "",
-    AI: ${AI_ENABLED ? "✅ ON" : "❌ OFF"},
-    AI model: ${AI_MODEL},
+    `AI: ${AI_ENABLED ? "✅ ON" : "❌ OFF"}`,
+    `AI model: ${AI_MODEL}`,
     "",
-    Keys present: ${keysLine},
+    `Keys present: ${keysLine}`,
     "",
     "Trading: OFF (data-only)",
   ].join("\n");
@@ -138,11 +124,11 @@ bot.callbackQuery("status:less", async (ctx) => {
 });
 
 // ----- NO-SPACE UPDOWN COMMANDS -----
-// Matches: /updownbtc5m, /updowneth15m, etc.
+// /updownbtc5m, /updowneth15m, etc.
 bot.hears(/^\/updown(btc|eth)(5m|15m|60m)$/i, async (ctx) => {
   const [, asset, intervalStr] = ctx.match;
 
-  await ctx.reply(🔎 Finding LIVE ${asset.toUpperCase()} Up/Down ${intervalStr} via CLOB…);
+  await ctx.reply(`🔎 Finding LIVE ${asset.toUpperCase()} Up/Down ${intervalStr} via CLOB…`);
 
   try {
     const res = await resolveLiveUpDown(asset.toLowerCase(), intervalStr.toLowerCase());
@@ -153,7 +139,6 @@ bot.hears(/^\/updown(btc|eth)(5m|15m|60m)$/i, async (ctx) => {
   }
 });
 
-// Friendly hint if they type wrong format
 bot.on("message:text", async (ctx) => {
   const t = (ctx.message?.text || "").trim();
   if (t.startsWith("/updown") && !/^\/updown(btc|eth)(5m|15m|60m)$/i.test(t)) {
@@ -175,7 +160,6 @@ bot.catch((err) => {
 async function startPollingWithRetry() {
   while (true) {
     try {
-      console.log("STARTING POLLING =>", INSTANCE);
       await bot.start();
       console.log("bot.start exited unexpectedly; restarting in 5s…");
       await sleep(5000);
@@ -193,7 +177,6 @@ async function startPollingWithRetry() {
 
 console.log("BOOT ✅", { SIM_ON, SIM_START_CASH, AI_ENABLED, AI_MODEL });
 await ensurePollingMode();
-await logIdentity();
 console.log("Bot running ✅ (polling)");
 
 await startPollingWithRetry();

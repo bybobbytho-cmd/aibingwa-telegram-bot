@@ -13,7 +13,27 @@ if (!token) throw new Error("Missing TELEGRAM_BOT_TOKEN");
 
 const AI_ENABLED = String(process.env.AI_ENABLED || "false").toLowerCase() === "true";
 const AI_MODEL = process.env.AI_MODEL || "unset";
-const MODE = String(process.env.MODE || "SIM").toUpperCase();
+
+// SIM is ON if MODE=SIMULATION (or SIM). Anything else means OFF.
+const MODE_RAW = String(process.env.MODE || "SIMULATION").toUpperCase();
+const SIM_ON = MODE_RAW === "SIM" || MODE_RAW === "SIMULATION";
+
+// Starting simulated cash (Stage 2 will persist this; for now it's a configurable starting value)
+const SIM_START_CASH = Number(process.env.SIM_START_CASH || 50);
+
+// “Keys active” (presence only, no values)
+function keyOn(name) {
+  const v = process.env[name];
+  return typeof v === "string" && v.trim().length > 0;
+}
+
+const ACTIVE_KEYS = {
+  telegram: true, // we know token exists or bot wouldn't start
+  bankr: keyOn("BANKR_API_KEY"),
+  anthropic: keyOn("ANTHROPIC_API_KEY"),
+  openai: keyOn("OPENAI_API_KEY"),
+  gemini: keyOn("GEMINI_API_KEY") || keyOn("GOOGLE_API_KEY"),
+};
 
 const INSTANCE =
   process.env.RAILWAY_REPLICA_ID ||
@@ -22,7 +42,6 @@ const INSTANCE =
   "unknown";
 
 const bot = new Bot(token);
-
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function tgGet(path) {
@@ -61,14 +80,33 @@ async function logIdentity() {
   }
 }
 
+function statusMessage() {
+  const keysLine = [
+    `Telegram: ✅`,
+    `Bankr: ${ACTIVE_KEYS.bankr ? "✅" : "❌"}`,
+    `Anthropic: ${ACTIVE_KEYS.anthropic ? "✅" : "❌"}`,
+    `OpenAI: ${ACTIVE_KEYS.openai ? "✅" : "❌"}`,
+    `Gemini: ${ACTIVE_KEYS.gemini ? "✅" : "❌"}`,
+  ].join(" | ");
+
+  return [
+    "📊 Status",
+    "",
+    `Simulation: ${SIM_ON ? "✅ ON" : "❌ OFF"}`,
+    `Sim cash: $${SIM_START_CASH}`,
+    "",
+    `AI: ${AI_ENABLED ? "✅ ON" : "❌ OFF"}`,
+    `AI model: ${AI_MODEL}`,
+    "",
+    `Keys: ${keysLine}`,
+    "",
+    "Data source: Polymarket Gamma API (public)",
+  ].join("\n");
+}
+
 function helpText() {
   return [
     "Bot is live ✅",
-    "",
-    `Mode: ${MODE}`,
-    `AI: ${AI_ENABLED ? "on" : "off"}`,
-    `AI_MODEL: ${AI_MODEL}`,
-    `Instance: ${INSTANCE}`,
     "",
     "Commands:",
     "• /ping",
@@ -82,25 +120,10 @@ function helpText() {
   ].join("\n");
 }
 
-// ---- Commands ----
+// Commands
 bot.command("start", async (ctx) => ctx.reply(helpText()));
-
 bot.command("ping", async (ctx) => ctx.reply("pong ✅"));
-
-bot.command("status", async (ctx) => {
-  await ctx.reply(
-    [
-      "📊 Status",
-      `Mode: ${MODE}`,
-      `AI: ${AI_ENABLED ? "on" : "off"}`,
-      `AI_MODEL: ${AI_MODEL}`,
-      `Instance: ${INSTANCE}`,
-      "",
-      "Data: Polymarket Gamma API (public)",
-      "Trading: OFF (data only)",
-    ].join("\n"),
-  );
-});
+bot.command("status", async (ctx) => ctx.reply(statusMessage()));
 
 bot.command("markets", async (ctx) => {
   const text = ctx.message?.text || "";
@@ -108,7 +131,7 @@ bot.command("markets", async (ctx) => {
   const queryRaw = parts.slice(1).join(" ").trim();
 
   if (!queryRaw) {
-    await ctx.reply("Usage: /markets bitcoin   (or /markets eth /markets trending)");
+    await ctx.reply("Usage: /markets bitcoin  (or /markets eth /markets trending)");
     return;
   }
 
@@ -126,9 +149,12 @@ bot.command("markets", async (ctx) => {
 
     const markets = await searchActiveMarkets(query, { limit: 10 });
     if (!markets.length) {
-      await ctx.reply(`No active markets found for: ${query}`);
+      await ctx.reply(
+        `No markets found for: ${query}\n\nTry broader terms like:\n• /markets btc\n• /markets crypto\n• /markets price`,
+      );
       return;
     }
+
     await ctx.reply(formatMarketListMessage(query, markets));
   } catch (e) {
     console.error("markets error:", e);
@@ -144,7 +170,7 @@ bot.command("updown", async (ctx) => {
   const horizon = (parts[2] || "").toLowerCase();
 
   if (!asset || !horizon) {
-    await ctx.reply("Usage: /updown btc 5m   (also 15m, 60m)");
+    await ctx.reply("Usage: /updown btc 5m  (also 15m, 60m)");
     return;
   }
 
@@ -165,7 +191,7 @@ bot.command("updown", async (ctx) => {
   try {
     const result = await findBestUpDownMarket(normalizedAsset, horizon);
     if (!result) {
-      await ctx.reply("No matching Up/Down market found right now. Try /markets bitcoin");
+      await ctx.reply("No matching Up/Down market found right now. Try /markets crypto");
       return;
     }
     await ctx.reply(formatUpDownMessage(result, normalizedAsset, horizon));
@@ -175,21 +201,17 @@ bot.command("updown", async (ctx) => {
   }
 });
 
-// ---- Error handling ----
+// Error handling
 bot.catch((err) => {
   const e = err.error;
   console.error("bot.catch =>", err);
 
-  if (e instanceof GrammyError) {
-    console.error("GrammyError =>", e.description);
-  } else if (e instanceof HttpError) {
-    console.error("HttpError =>", e.error);
-  } else {
-    console.error("Unknown error =>", e);
-  }
+  if (e instanceof GrammyError) console.error("GrammyError =>", e.description);
+  else if (e instanceof HttpError) console.error("HttpError =>", e.error);
+  else console.error("Unknown error =>", e);
 });
 
-// ---- Start (with 409 retry so it doesn't die) ----
+// Start with 409 retry (keeps bot alive if Telegram briefly conflicts)
 async function startPollingWithRetry() {
   while (true) {
     try {
@@ -209,7 +231,7 @@ async function startPollingWithRetry() {
   }
 }
 
-console.log("BOOT ✅", { MODE, AI_ENABLED, AI_MODEL, INSTANCE });
+console.log("BOOT ✅", { SIM_ON, SIM_START_CASH, AI_ENABLED, AI_MODEL, INSTANCE });
 await ensurePollingMode();
 await logIdentity();
 console.log("Bot running ✅ (polling)", { INSTANCE });

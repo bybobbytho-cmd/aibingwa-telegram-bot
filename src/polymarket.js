@@ -12,10 +12,7 @@ function toQueryString(params = {}) {
 
 async function gammaGet(path, params) {
   const url = `${GAMMA_BASE}${path}${toQueryString(params)}`;
-  const res = await fetch(url, {
-    method: "GET",
-    headers: { accept: "application/json" },
-  });
+  const res = await fetch(url, { headers: { accept: "application/json" } });
 
   if (!res.ok) {
     const body = await res.text().catch(() => "");
@@ -38,6 +35,8 @@ function flattenMarketsFromPublicSearch(payload) {
         eventEndDate: ev?.endDate,
         eventActive: ev?.active,
         eventClosed: ev?.closed,
+        eventArchived: ev?.archived,
+        eventRestricted: ev?.restricted,
         eventVolume: ev?.volume,
         eventLiquidity: ev?.liquidity,
       });
@@ -50,12 +49,21 @@ function flattenMarketsFromPublicSearch(payload) {
   return out;
 }
 
+// ✅ Less strict: treat missing flags as "unknown", not "false"
 function isLiveMarket(m) {
   const active = m?.active ?? m?.eventActive;
   const closed = m?.closed ?? m?.eventClosed;
-  const archived = m?.archived;
-  const restricted = m?.restricted;
-  return active === true && closed === false && archived !== true && restricted !== true;
+  const archived = m?.archived ?? m?.eventArchived;
+  const restricted = m?.restricted ?? m?.eventRestricted;
+
+  // If something is explicitly true/false, respect it.
+  // If missing, do NOT exclude.
+  if (archived === true) return false;
+  if (restricted === true) return false;
+  if (closed === true) return false;
+  if (active === false) return false;
+
+  return true;
 }
 
 function safeNum(x) {
@@ -87,16 +95,19 @@ function normalizePrices(m) {
 
 function marketUrl(m) {
   const slug = m?.slug || m?.eventSlug;
-  if (!slug) return null;
-  return `https://polymarket.com/market/${slug}`;
+  return slug ? `https://polymarket.com/market/${slug}` : null;
 }
 
 export async function searchActiveMarkets(query, { limit = 10 } = {}) {
+  // Public search is the right way to search by text
   const payload = await gammaGet("/public-search", { q: query });
   const all = flattenMarketsFromPublicSearch(payload);
-  const live = all.filter(isLiveMarket);
 
-  live.sort((a, b) => {
+  // Only filter out markets that are explicitly not-live
+  const liveish = all.filter(isLiveMarket);
+
+  // Rank by volume/liquidity when available
+  liveish.sort((a, b) => {
     const av = safeNum(a?.volume) ?? safeNum(a?.eventVolume) ?? 0;
     const bv = safeNum(b?.volume) ?? safeNum(b?.eventVolume) ?? 0;
     const al = safeNum(a?.liquidity) ?? safeNum(a?.eventLiquidity) ?? 0;
@@ -105,20 +116,27 @@ export async function searchActiveMarkets(query, { limit = 10 } = {}) {
     return bl - al;
   });
 
-  return live.slice(0, limit);
+  return liveish.slice(0, limit);
 }
 
 export async function getTrendingActiveMarkets({ limit = 10 } = {}) {
+  // Docs use volume24hr (no underscore) :contentReference[oaicite:1]{index=1}
+  // Try events first (often includes markets)
   const payload = await gammaGet("/events", {
     active: true,
     closed: false,
-    order: "volume_24hr",
+    archived: false,
+    order: "volume24hr",
     ascending: false,
     limit: Math.max(limit, 25),
     offset: 0,
   });
 
-  const events = Array.isArray(payload) ? payload : Array.isArray(payload?.events) ? payload.events : [];
+  const events = Array.isArray(payload)
+    ? payload
+    : Array.isArray(payload?.events)
+      ? payload.events
+      : [];
 
   const markets = [];
   for (const ev of events) {
@@ -131,15 +149,18 @@ export async function getTrendingActiveMarkets({ limit = 10 } = {}) {
         eventEndDate: ev?.endDate,
         eventActive: ev?.active,
         eventClosed: ev?.closed,
+        eventArchived: ev?.archived,
+        eventRestricted: ev?.restricted,
         eventVolume: ev?.volume,
         eventLiquidity: ev?.liquidity,
       });
     }
   }
 
-  const live = markets.filter(isLiveMarket);
+  const liveish = markets.filter(isLiveMarket);
 
-  live.sort((a, b) => {
+  // Fallback: if no markets were embedded, just return empty cleanly
+  liveish.sort((a, b) => {
     const av = safeNum(a?.volume) ?? safeNum(a?.eventVolume) ?? 0;
     const bv = safeNum(b?.volume) ?? safeNum(b?.eventVolume) ?? 0;
     if (bv !== av) return bv - av;
@@ -148,7 +169,7 @@ export async function getTrendingActiveMarkets({ limit = 10 } = {}) {
     return bl - al;
   });
 
-  return live.slice(0, limit);
+  return liveish.slice(0, limit);
 }
 
 export async function findBestUpDownMarket(asset, horizon) {
@@ -160,6 +181,7 @@ export async function findBestUpDownMarket(asset, horizon) {
     `${assetName} up/down ${horizon}`,
     `${assetName} ${horizonText} up`,
     `${assetName} ${horizonText} down`,
+    `${assetName} up or down`,
   ];
 
   let candidates = [];
@@ -167,33 +189,31 @@ export async function findBestUpDownMarket(asset, horizon) {
     const payload = await gammaGet("/public-search", { q });
     const markets = flattenMarketsFromPublicSearch(payload).filter(isLiveMarket);
     candidates = candidates.concat(markets);
-    if (candidates.length >= 25) break;
+    if (candidates.length >= 50) break;
   }
 
-  const uniqueBySlug = new Map();
+  const unique = new Map();
   for (const m of candidates) {
     const key = m?.slug || m?.conditionId || m?.id;
     if (!key) continue;
-    if (!uniqueBySlug.has(key)) uniqueBySlug.set(key, m);
+    if (!unique.has(key)) unique.set(key, m);
   }
 
-  const unique = [...uniqueBySlug.values()];
+  const arr = [...unique.values()];
 
   function score(m) {
     const text = `${m?.question || ""} ${m?.title || ""} ${m?.eventTitle || ""}`.toLowerCase();
     let s = 0;
 
     if (text.includes(assetName.toLowerCase())) s += 4;
+    if (text.includes("up or down") || text.includes("up/down")) s += 3;
 
     if (horizon === "5m" && (text.includes("5 minute") || text.includes("5-minute") || text.includes("5m"))) s += 4;
     if (horizon === "15m" && (text.includes("15 minute") || text.includes("15-minute") || text.includes("15m"))) s += 4;
     if (
       horizon === "60m" &&
       (text.includes("60 minute") || text.includes("60-minute") || text.includes("60m") || text.includes("1 hour") || text.includes("one hour"))
-    )
-      s += 4;
-
-    if (text.includes("up or down") || text.includes("up/down")) s += 3;
+    ) s += 4;
 
     const v = safeNum(m?.volume) ?? safeNum(m?.eventVolume) ?? 0;
     const l = safeNum(m?.liquidity) ?? safeNum(m?.eventLiquidity) ?? 0;
@@ -203,8 +223,8 @@ export async function findBestUpDownMarket(asset, horizon) {
     return s;
   }
 
-  unique.sort((a, b) => score(b) - score(a));
-  return unique[0] || null;
+  arr.sort((a, b) => score(b) - score(a));
+  return arr[0] || null;
 }
 
 export function formatMarketListMessage(query, markets) {
@@ -230,7 +250,7 @@ export function formatMarketListMessage(query, markets) {
               return p === null ? `${o}: ?` : `${o}: ${(p * 100).toFixed(1)}%`;
             })
             .join(" | ")
-        : "Prices: (not available in this response)";
+        : "Prices: (not in response)";
 
     lines.push(`${i + 1}) ${title}`);
     lines.push(`   ${priceLine}`);
@@ -259,7 +279,7 @@ export function formatUpDownMessage(market, asset, horizon) {
             return p === null ? `${o}: ?` : `${o}: ${(p * 100).toFixed(1)}%`;
           })
           .join(" | ")
-      : "Prices: (not available in this response)";
+      : "Prices: (not in response)";
 
   return [
     `📈 Up/Down (${asset.toUpperCase()} ${horizon})`,
@@ -272,3 +292,4 @@ export function formatUpDownMessage(market, asset, horizon) {
     .filter(Boolean)
     .join("\n");
 }
+

@@ -1,12 +1,6 @@
 import "dotenv/config";
 import { Bot, GrammyError, HttpError, InlineKeyboard } from "grammy";
-import {
-  searchActiveMarkets,
-  getTrendingActiveMarkets,
-  findBestUpDownMarket,
-  formatMarketListMessage,
-  formatUpDownMessage,
-} from "./src/polymarket.js";
+import { resolveLiveUpDown, formatUpDownLiveMessage } from "./src/polymarket.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) throw new Error("Missing TELEGRAM_BOT_TOKEN");
@@ -64,20 +58,20 @@ async function logIdentity() {
       id: me.id,
       username: me.username,
       first_name: me.first_name,
-      instance: INSTANCE, // log-only, not shown to user
+      instance: INSTANCE, // logs only
     });
   } catch (e) {
     console.log("❌ getMe failed:", e?.message || e);
   }
 }
 
-// ----- STATUS UI (compact + “dropdown” button) -----
+// ----- STATUS (compact + expand) -----
 function statusCompact() {
   return [
     "📊 Status",
     `Simulation: ${SIM_ON ? "✅ ON" : "❌ OFF"}   Cash: $${SIM_START_CASH}`,
     `AI: ${AI_ENABLED ? "✅ ON" : "❌ OFF"}   Model: ${AI_MODEL}`,
-    "Data: Polymarket (Gamma + CLOB reads)",
+    "Data: Up/Down LIVE via Gamma + CLOB (public reads)",
   ].join("\n");
 }
 
@@ -110,26 +104,22 @@ function statusKeyboard(expanded = false) {
     : new InlineKeyboard().text("Show details ▾", "status:more");
 }
 
-function helpText() {
-  return [
-    "Bot is live ✅",
-    "",
-    "Commands:",
-    "• /ping",
-    "• /status",
-    "• /markets bitcoin",
-    "• /markets eth",
-    "• /markets trending",
-    "• /marketsbtc (alias)",
-    "• /marketseth (alias)",
-    "• /marketstrending (alias)",
-    "• /updown btc 5m",
-    "• /updown btc 15m",
-    "• /updown btc 60m",
-  ].join("\n");
-}
+bot.command("start", async (ctx) => {
+  await ctx.reply(
+    [
+      "Bot is live ✅",
+      "",
+      "No-space commands:",
+      "• /updownbtc5m  • /updownbtc15m  • /updownbtc60m",
+      "• /updowneth5m  • /updowneth15m  • /updowneth60m",
+      "",
+      "Other:",
+      "• /ping",
+      "• /status",
+    ].join("\n"),
+  );
+});
 
-bot.command("start", async (ctx) => ctx.reply(helpText()));
 bot.command("ping", async (ctx) => ctx.reply("pong ✅"));
 
 bot.command("status", async (ctx) => {
@@ -146,97 +136,32 @@ bot.callbackQuery("status:less", async (ctx) => {
   await ctx.editMessageText(statusCompact(), { reply_markup: statusKeyboard(false) });
 });
 
-// ----- MARKETS -----
-async function handleMarkets(ctx, queryRaw) {
-  if (!queryRaw) {
-    await ctx.reply("Usage: /markets bitcoin  (or /markets eth /markets trending)");
-    return;
-  }
+// ----- NO-SPACE UPDOWN COMMANDS -----
+// Matches: /updownbtc5m, /updowneth15m, etc.
+bot.hears(/^\/updown(btc|eth)(5m|15m|60m)$/i, async (ctx) => {
+  const [, asset, intervalStr] = ctx.match;
 
-  const q = queryRaw.toLowerCase();
-  const query = q === "btc" ? "bitcoin" : q === "eth" ? "ethereum" : queryRaw;
-
-  await ctx.reply("🔎 Fetching markets from Polymarket…");
+  await ctx.reply(`🔎 Resolving LIVE ${asset.toUpperCase()} Up/Down ${intervalStr}…`);
 
   try {
-    if (query.toLowerCase() === "trending") {
-      const markets = await getTrendingActiveMarkets({ limit: 10 });
-      if (!markets.length) {
-        await ctx.reply("No trending markets returned right now. Try again in a minute.");
-        return;
-      }
-      await ctx.reply(formatMarketListMessage("trending", markets));
-      return;
-    }
-
-    const markets = await searchActiveMarkets(query, { limit: 10 });
-    if (!markets.length) {
-      await ctx.reply(
-        `No markets found for: ${query}\n\nTry:\n• /markets crypto\n• /markets price\n• /markets election`,
-      );
-      return;
-    }
-
-    await ctx.reply(formatMarketListMessage(query, markets));
+    const res = await resolveLiveUpDown(asset.toLowerCase(), intervalStr.toLowerCase());
+    await ctx.reply(formatUpDownLiveMessage(res, asset, intervalStr));
   } catch (e) {
-    console.error("markets error:", e);
-    await ctx.reply("⚠️ markets failed. Check Railway logs for the error.");
-  }
-}
-
-bot.command("markets", async (ctx) => {
-  const text = ctx.message?.text || "";
-  const parts = text.trim().split(/\s+/);
-  const queryRaw = parts.slice(1).join(" ").trim();
-  await handleMarkets(ctx, queryRaw);
-});
-
-// Aliases (no space)
-bot.command("marketsbtc", async (ctx) => handleMarkets(ctx, "bitcoin"));
-bot.command("marketseth", async (ctx) => handleMarkets(ctx, "ethereum"));
-bot.command("marketstrending", async (ctx) => handleMarkets(ctx, "trending"));
-
-// ----- UPDOWN (Gamma discovery now; next step will add CLOB live odds) -----
-bot.command("updown", async (ctx) => {
-  const text = ctx.message?.text || "";
-  const parts = text.trim().split(/\s+/);
-
-  const asset = (parts[1] || "").toLowerCase();
-  const horizon = (parts[2] || "").toLowerCase();
-
-  if (!asset || !horizon) {
-    await ctx.reply("Usage: /updown btc 5m  (also 15m, 60m)");
-    return;
-  }
-
-  if (!["btc", "eth", "bitcoin", "ethereum"].includes(asset)) {
-    await ctx.reply("Supported assets for now: btc, eth");
-    return;
-  }
-
-  if (!["5m", "15m", "60m"].includes(horizon)) {
-    await ctx.reply("Supported horizons: 5m, 15m, 60m");
-    return;
-  }
-
-  const normalizedAsset = asset === "bitcoin" ? "btc" : asset === "ethereum" ? "eth" : asset;
-
-  await ctx.reply("📈 Finding best LIVE Up/Down market…");
-
-  try {
-    const result = await findBestUpDownMarket(normalizedAsset, horizon);
-    if (!result) {
-      await ctx.reply("No matching Up/Down market found right now. Try /markets crypto");
-      return;
-    }
-    await ctx.reply(formatUpDownMessage(result, normalizedAsset, horizon));
-  } catch (e) {
-    console.error("updown error:", e);
-    await ctx.reply("⚠️ updown failed. Check Railway logs for the error.");
+    console.error("updown resolver error:", e);
+    await ctx.reply("⚠️ Up/Down failed. Check Railway logs for details.");
   }
 });
 
-// ----- Errors -----
+// Helpful “unknown command” fallback (optional)
+bot.on("message:text", async (ctx) => {
+  const t = (ctx.message?.text || "").trim();
+  if (t.startsWith("/updown") && !/^\/updown(btc|eth)(5m|15m|60m)$/i.test(t)) {
+    await ctx.reply(
+      "Use:\n/updownbtc5m\n/updownbtc15m\n/updownbtc60m\n/updowneth5m\n/updowneth15m\n/updowneth60m",
+    );
+  }
+});
+
 bot.catch((err) => {
   const e = err.error;
   console.error("bot.catch =>", err);
@@ -246,7 +171,6 @@ bot.catch((err) => {
   else console.error("Unknown error =>", e);
 });
 
-// ----- Start (409 retry safe) -----
 async function startPollingWithRetry() {
   while (true) {
     try {
@@ -266,9 +190,9 @@ async function startPollingWithRetry() {
   }
 }
 
-console.log("BOOT ✅", { SIM_ON, SIM_START_CASH, AI_ENABLED, AI_MODEL, INSTANCE });
+console.log("BOOT ✅", { SIM_ON, SIM_START_CASH, AI_ENABLED, AI_MODEL });
 await ensurePollingMode();
 await logIdentity();
-console.log("Bot running ✅ (polling)", { INSTANCE });
+console.log("Bot running ✅ (polling)");
 
 await startPollingWithRetry();

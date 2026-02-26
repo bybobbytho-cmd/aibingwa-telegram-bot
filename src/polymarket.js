@@ -1,298 +1,196 @@
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
+const CLOB_BASE = "https://clob.polymarket.com";
 
-function toQueryString(params = {}) {
-  const usp = new URLSearchParams();
+function qs(params = {}) {
+  const u = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) {
     if (v === undefined || v === null) continue;
-    if (Array.isArray(v)) {
-      for (const item of v) usp.append(k, String(item));
-    } else {
-      usp.set(k, String(v));
-    }
+    u.set(k, String(v));
   }
-  const s = usp.toString();
+  const s = u.toString();
   return s ? `?${s}` : "";
 }
 
-async function gammaGet(path, params) {
-  const url = `${GAMMA_BASE}${path}${toQueryString(params)}`;
+async function getJson(url) {
   const res = await fetch(url, { headers: { accept: "application/json" } });
-
   if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`Gamma API error ${res.status} for ${url} :: ${body.slice(0, 250)}`);
+    const t = await res.text().catch(() => "");
+    const err = new Error(`HTTP ${res.status} ${url} :: ${t.slice(0, 200)}`);
+    err.status = res.status;
+    throw err;
   }
   return res.json();
 }
 
-function safeNum(x) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : null;
-}
-
-function normalizePrices(m) {
-  const outcomesRaw = m?.outcomes;
-  const outcomePricesRaw = m?.outcomePrices;
-
-  let outcomes = [];
-  let prices = [];
-
-  try {
-    outcomes = Array.isArray(outcomesRaw) ? outcomesRaw : JSON.parse(outcomesRaw || "[]");
-  } catch {
-    outcomes = [];
+async function getText(url) {
+  const res = await fetch(url, { headers: { accept: "text/plain" } });
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    const err = new Error(`HTTP ${res.status} ${url} :: ${t.slice(0, 200)}`);
+    err.status = res.status;
+    throw err;
   }
-
-  try {
-    prices = Array.isArray(outcomePricesRaw) ? outcomePricesRaw : JSON.parse(outcomePricesRaw || "[]");
-  } catch {
-    prices = [];
-  }
-
-  return { outcomes, prices };
+  return res.text();
 }
 
-function marketUrl(m) {
-  const slug = m?.slug;
-  return slug ? `https://polymarket.com/market/${slug}` : null;
-}
-
-// ✅ Live-ish filter: only exclude if explicitly not-live
-function isLiveMarket(m) {
-  const archived = m?.archived;
-  const restricted = m?.restricted;
-  const closed = m?.closed;
-  const active = m?.active;
-
-  if (archived === true) return false;
-  if (restricted === true) return false;
-  if (closed === true) return false;
-  if (active === false) return false;
-  return true;
-}
-
-// --- Core: Public search returns EVENTS, not guaranteed markets. ---
-// We must:
-// 1) /public-search -> event ids
-// 2) /events/{id} -> event with markets
-async function searchEventsByText(query, { limit = 6, page = 1 } = {}) {
-  // q is required in docs, and events_status can filter active events. :contentReference[oaicite:1]{index=1}
-  return gammaGet("/public-search", {
-    q: query,
-    events_status: "active",
-    limit_per_type: limit,
-    page,
-    search_tags: false,
-    search_profiles: false,
-    optimized: true,
-  });
-}
-
-async function getEventById(id) {
-  // list events doc shows /events and single event endpoints exist :contentReference[oaicite:2]{index=2}
-  return gammaGet(`/events/${encodeURIComponent(id)}`);
-}
-
-function flattenMarketsFromEvents(events = []) {
-  const markets = [];
-  for (const ev of events) {
-    const ms = Array.isArray(ev?.markets) ? ev.markets : [];
-    for (const m of ms) {
-      markets.push({
-        ...m,
-        eventTitle: ev?.title,
-        eventId: ev?.id,
-        eventSlug: ev?.slug,
-        eventEndDate: ev?.endDate,
-        eventActive: ev?.active,
-        eventClosed: ev?.closed,
-        eventArchived: ev?.archived,
-        eventRestricted: ev?.restricted,
-        eventVolume24hr: ev?.volume24hr,
-        eventVolume: ev?.volume,
-        eventLiquidity: ev?.liquidity,
-      });
+function safeArrayMaybeJson(v) {
+  if (Array.isArray(v)) return v;
+  if (typeof v === "string") {
+    try {
+      const parsed = JSON.parse(v);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
     }
   }
-  return markets;
+  return [];
 }
 
-function marketRankScore(m) {
-  const v24 = safeNum(m?.volume24hr) ?? safeNum(m?.eventVolume24hr) ?? 0;
-  const v = safeNum(m?.volume) ?? safeNum(m?.eventVolume) ?? 0;
-  const l = safeNum(m?.liquidity) ?? safeNum(m?.eventLiquidity) ?? 0;
-
-  // Prefer 24h volume, then total volume, then liquidity
-  return v24 * 1000 + v * 10 + l;
+/**
+ * Uses CLOB /time so our window math matches Polymarket server time.
+ * Docs: GET https://clob.polymarket.com/time :contentReference[oaicite:3]{index=3}
+ */
+export async function getClobServerTimeSec() {
+  const txt = await getText(`${CLOB_BASE}/time`);
+  const n = Number(txt);
+  if (!Number.isFinite(n)) throw new Error(`Invalid /time response: ${txt}`);
+  return n;
 }
 
-export async function searchActiveMarkets(query, { limit = 10 } = {}) {
-  // 1) Get event IDs from search
-  const payload = await searchEventsByText(query, { limit: 8, page: 1 });
-  const events = Array.isArray(payload?.events) ? payload.events : [];
-
-  if (!events.length) return [];
-
-  // 2) Fetch full events with embedded markets
-  // Keep it safe: only first N events to avoid rate limits
-  const top = events.slice(0, 8);
-
-  const fullEvents = await Promise.all(
-    top.map(async (e) => {
-      try {
-        return await getEventById(e.id);
-      } catch {
-        return null;
-      }
-    }),
-  );
-
-  const goodEvents = fullEvents.filter(Boolean);
-
-  // 3) Flatten markets + filter live-ish
-  const markets = flattenMarketsFromEvents(goodEvents).filter(isLiveMarket);
-
-  // 4) Sort best first
-  markets.sort((a, b) => marketRankScore(b) - marketRankScore(a));
-
-  return markets.slice(0, limit);
+export function intervalToSeconds(intervalStr) {
+  const map = { "5m": 300, "15m": 900, "60m": 3600 };
+  const sec = map[String(intervalStr).toLowerCase()];
+  if (!sec) throw new Error(`Unsupported interval: ${intervalStr}`);
+  return sec;
 }
 
-export async function getTrendingActiveMarkets({ limit = 10 } = {}) {
-  // Events endpoint supports active/closed + ordering. :contentReference[oaicite:3]{index=3}
-  const events = await gammaGet("/events", {
-    active: true,
-    closed: false,
-    archived: false,
-    order: "volume24hr",
-    ascending: false,
-    limit: 20,
-    offset: 0,
-  });
-
-  const arr = Array.isArray(events) ? events : Array.isArray(events?.events) ? events.events : [];
-  const markets = flattenMarketsFromEvents(arr).filter(isLiveMarket);
-
-  markets.sort((a, b) => marketRankScore(b) - marketRankScore(a));
-  return markets.slice(0, limit);
+export function buildUpDownSlug(asset, intervalStr, windowStartSec) {
+  const a = String(asset).toLowerCase(); // btc or eth
+  const i = String(intervalStr).toLowerCase(); // 5m, 15m, 60m
+  return `${a}-updown-${i}-${windowStartSec}`;
 }
 
-export async function findBestUpDownMarket(asset, horizon) {
-  const assetName = asset === "btc" ? "bitcoin" : asset === "eth" ? "ethereum" : asset;
-  const horizonText = horizon === "5m" ? "5 minute" : horizon === "15m" ? "15 minute" : "60 minute";
+export async function getEventBySlug(slug) {
+  // Docs: GET /events/slug/{slug} :contentReference[oaicite:4]{index=4}
+  const url = `${GAMMA_BASE}/events/slug/${encodeURIComponent(slug)}`;
+  return getJson(url);
+}
 
-  // Search a few relevant phrases
-  const queries = [
-    `${assetName} up or down ${horizonText}`,
-    `${assetName} up or down`,
-    `${assetName} ${horizonText}`,
-    `${assetName} price ${horizonText}`,
+/**
+ * Extract token IDs for Up/Down from Gamma event object.
+ * Typically: event.markets[0].clobTokenIds => ["<UP_TOKEN_ID>", "<DOWN_TOKEN_ID>"] (array or JSON string)
+ */
+export function extractUpDownTokenIdsFromEvent(event) {
+  const markets = Array.isArray(event?.markets) ? event.markets : [];
+  if (!markets.length) return null;
+
+  // Up/Down events typically have one market with 2 outcomes
+  const m = markets[0];
+  const tokenIds = safeArrayMaybeJson(m?.clobTokenIds);
+
+  if (tokenIds.length < 2) return null;
+
+  return {
+    upTokenId: String(tokenIds[0]),
+    downTokenId: String(tokenIds[1]),
+    market: m,
+  };
+}
+
+export async function getClobPrices(tokenIds) {
+  // Docs: GET /prices (multiple token IDs) :contentReference[oaicite:5]{index=5}
+  // Most deployments accept comma-separated token_ids.
+  const token_ids = tokenIds.join(",");
+  const url = `${CLOB_BASE}/prices${qs({ token_ids })}`;
+  return getJson(url); // returns map: { [tokenId]: price }
+}
+
+/**
+ * The deterministic pipeline:
+ * 1) get CLOB server time
+ * 2) compute window start
+ * 3) build slug (btc-updown-15m-<ts>)
+ * 4) fetch Gamma event by slug
+ * 5) extract clobTokenIds
+ * 6) fetch live odds from CLOB /prices
+ *
+ * Resilience:
+ * - if exact window isn’t ready (race at boundary), try previous window
+ */
+export async function resolveLiveUpDown(asset, intervalStr) {
+  const assetNorm = String(asset).toLowerCase(); // btc / eth
+  const seconds = intervalToSeconds(intervalStr);
+
+  const serverNow = await getClobServerTimeSec();
+  const windowStart = Math.floor(serverNow / seconds) * seconds;
+
+  const candidates = [
+    buildUpDownSlug(assetNorm, intervalStr, windowStart),
+    buildUpDownSlug(assetNorm, intervalStr, windowStart - seconds), // fallback if boundary not indexed yet
   ];
 
-  let candidates = [];
-  for (const q of queries) {
-    const ms = await searchActiveMarkets(q, { limit: 10 });
-    candidates = candidates.concat(ms);
-    if (candidates.length >= 30) break;
+  let lastErr = null;
+
+  for (const slug of candidates) {
+    try {
+      const event = await getEventBySlug(slug);
+      const extracted = extractUpDownTokenIdsFromEvent(event);
+      if (!extracted) {
+        throw new Error(`Event found but clobTokenIds missing for slug=${slug}`);
+      }
+
+      const { upTokenId, downTokenId } = extracted;
+      const prices = await getClobPrices([upTokenId, downTokenId]);
+
+      const up = Number(prices?.[upTokenId]);
+      const down = Number(prices?.[downTokenId]);
+
+      return {
+        ok: true,
+        slug,
+        title: event?.title || event?.ticker || slug,
+        upTokenId,
+        downTokenId,
+        upPrice: Number.isFinite(up) ? up : null, // 0..1
+        downPrice: Number.isFinite(down) ? down : null, // 0..1
+        event,
+      };
+    } catch (e) {
+      lastErr = e;
+      continue;
+    }
   }
 
-  // Deduplicate
-  const map = new Map();
-  for (const m of candidates) {
-    const key = m?.slug || m?.conditionId || m?.id;
-    if (!key) continue;
-    if (!map.has(key)) map.set(key, m);
-  }
-
-  const arr = [...map.values()];
-
-  // Score: must contain asset + "up or down" + horizon if possible
-  function score(m) {
-    const text = `${m?.question || ""} ${m?.eventTitle || ""}`.toLowerCase();
-    let s = 0;
-
-    if (text.includes(assetName)) s += 5;
-    if (text.includes("up or down") || text.includes("up/down")) s += 5;
-
-    if (horizon === "5m" && (text.includes("5 minute") || text.includes("5m"))) s += 4;
-    if (horizon === "15m" && (text.includes("15 minute") || text.includes("15m"))) s += 4;
-    if (
-      horizon === "60m" &&
-      (text.includes("60 minute") || text.includes("60m") || text.includes("1 hour"))
-    )
-      s += 4;
-
-    s += Math.min(10, Math.log10((safeNum(m?.volume24hr) ?? 0) + 1) * 4);
-    s += Math.min(6, Math.log10((safeNum(m?.liquidityNum) ?? safeNum(m?.liquidity) ?? 0) + 1) * 3);
-    return s;
-  }
-
-  arr.sort((a, b) => score(b) - score(a));
-  return arr[0] || null;
+  return {
+    ok: false,
+    error: lastErr?.message || "Failed to resolve Up/Down market",
+    debug: { asset: assetNorm, intervalStr, tried: candidates },
+  };
 }
 
-export function formatMarketListMessage(query, markets) {
-  const lines = [];
-  lines.push(`📌 Live markets: ${query}`);
-  lines.push("");
-
-  for (let i = 0; i < markets.length; i++) {
-    const m = markets[i];
-    const title = m?.question || m?.eventTitle || "Untitled market";
-    const url = marketUrl(m);
-
-    const { outcomes, prices } = normalizePrices(m);
-
-    const priceLine =
-      outcomes.length && prices.length
-        ? outcomes
-            .map((o, idx) => {
-              const p = safeNum(prices[idx]);
-              return p === null ? `${o}: ?` : `${o}: ${(p * 100).toFixed(1)}%`;
-            })
-            .join(" | ")
-        : "Prices: (not returned)";
-
-    const v24 = safeNum(m?.volume24hr) ?? safeNum(m?.eventVolume24hr);
-    const v = safeNum(m?.volume) ?? safeNum(m?.eventVolume);
-    const liq = safeNum(m?.liquidityNum) ?? safeNum(m?.liquidity) ?? safeNum(m?.eventLiquidity);
-
-    lines.push(`${i + 1}) ${title}`);
-    lines.push(`   ${priceLine}`);
-    lines.push(`   Vol24h: ${v24 ?? "?"} | Vol: ${v ?? "?"} | Liq: ${liq ?? "?"}`);
-    if (url) lines.push(`   ${url}`);
-    lines.push("");
+// Simple formatter (no Markdown needed)
+export function formatUpDownLiveMessage(res, asset, intervalStr) {
+  if (!res?.ok) {
+    return [
+      `❌ Up/Down market not found yet.`,
+      `Asset: ${asset.toUpperCase()} | Interval: ${intervalStr}`,
+      `Tried: ${res?.debug?.tried?.join(" , ") || "?"}`,
+      `Tip: if you run this on the exact boundary, try again in ~10 seconds.`,
+    ].join("\n");
   }
 
-  return lines.join("\n");
-}
+  const upPct = res.upPrice === null ? "?" : (res.upPrice * 100).toFixed(1) + "%";
+  const downPct = res.downPrice === null ? "?" : (res.downPrice * 100).toFixed(1) + "%";
 
-export function formatUpDownMessage(market, asset, horizon) {
-  const title = market?.question || market?.eventTitle || "Up/Down market";
-  const url = marketUrl(market);
-
-  const { outcomes, prices } = normalizePrices(market);
-  const priceLine =
-    outcomes.length && prices.length
-      ? outcomes
-          .map((o, idx) => {
-            const p = safeNum(prices[idx]);
-            return p === null ? `${o}: ?` : `${o}: ${(p * 100).toFixed(1)}%`;
-          })
-          .join(" | ")
-      : "Prices: (not returned)";
-
-  const v24 = safeNum(market?.volume24hr) ?? safeNum(market?.eventVolume24hr);
-  const liq = safeNum(market?.liquidityNum) ?? safeNum(market?.liquidity) ?? safeNum(market?.eventLiquidity);
+  const url = `https://polymarket.com/event/${res.slug}`;
 
   return [
-    `📈 Up/Down (${asset.toUpperCase()} ${horizon})`,
-    title,
+    `📈 Up/Down LIVE (${asset.toUpperCase()} ${intervalStr})`,
+    res.title,
     "",
-    priceLine,
-    `Vol24h: ${v24 ?? "?"} | Liq: ${liq ?? "?"}`,
-    url ? url : "",
-  ]
-    .filter(Boolean)
-    .join("\n");
+    `UP: ${upPct}`,
+    `DOWN: ${downPct}`,
+    "",
+    url,
+  ].join("\n");
 }

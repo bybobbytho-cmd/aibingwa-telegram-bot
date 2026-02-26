@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { Bot, GrammyError, HttpError } from "grammy";
+import { Bot, GrammyError, HttpError, InlineKeyboard } from "grammy";
 import {
   searchActiveMarkets,
   getTrendingActiveMarkets,
@@ -14,32 +14,27 @@ if (!token) throw new Error("Missing TELEGRAM_BOT_TOKEN");
 const AI_ENABLED = String(process.env.AI_ENABLED || "false").toLowerCase() === "true";
 const AI_MODEL = process.env.AI_MODEL || "unset";
 
-// SIM is ON if MODE=SIMULATION (or SIM). Anything else means OFF.
 const MODE_RAW = String(process.env.MODE || "SIMULATION").toUpperCase();
 const SIM_ON = MODE_RAW === "SIM" || MODE_RAW === "SIMULATION";
-
-// Starting simulated cash (Stage 2 will persist this; for now it's a configurable starting value)
 const SIM_START_CASH = Number(process.env.SIM_START_CASH || 50);
-
-// “Keys active” (presence only, no values)
-function keyOn(name) {
-  const v = process.env[name];
-  return typeof v === "string" && v.trim().length > 0;
-}
-
-const ACTIVE_KEYS = {
-  telegram: true, // we know token exists or bot wouldn't start
-  bankr: keyOn("BANKR_API_KEY"),
-  anthropic: keyOn("ANTHROPIC_API_KEY"),
-  openai: keyOn("OPENAI_API_KEY"),
-  gemini: keyOn("GEMINI_API_KEY") || keyOn("GOOGLE_API_KEY"),
-};
 
 const INSTANCE =
   process.env.RAILWAY_REPLICA_ID ||
   process.env.RAILWAY_SERVICE_ID ||
   process.env.HOSTNAME ||
   "unknown";
+
+function keyOn(name) {
+  const v = process.env[name];
+  return typeof v === "string" && v.trim().length > 0;
+}
+
+const ACTIVE_KEYS = {
+  bankr: keyOn("BANKR_API_KEY"),
+  anthropic: keyOn("ANTHROPIC_API_KEY"),
+  openai: keyOn("OPENAI_API_KEY"),
+  gemini: keyOn("GEMINI_API_KEY") || keyOn("GOOGLE_API_KEY"),
+};
 
 const bot = new Bot(token);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -59,11 +54,7 @@ async function ensurePollingMode() {
   console.log("Telegram getWebhookInfo =>", info?.json || info);
 
   const url = info?.json?.result?.url;
-  if (typeof url === "string" && url.length === 0) {
-    console.log("✅ Webhook cleared. Polling should work.");
-  } else {
-    console.log("⚠️ Webhook still set to:", url);
-  }
+  if (typeof url === "string" && url.length === 0) console.log("✅ Webhook cleared. Polling should work.");
 }
 
 async function logIdentity() {
@@ -80,9 +71,17 @@ async function logIdentity() {
   }
 }
 
-function statusMessage() {
+function statusCompact() {
+  return [
+    "📊 Status",
+    `Simulation: ${SIM_ON ? "✅ ON" : "❌ OFF"} | Cash: $${SIM_START_CASH}`,
+    `AI: ${AI_ENABLED ? "✅ ON" : "❌ OFF"} | Model: ${AI_MODEL}`,
+    "Data: Gamma API (public)",
+  ].join("\n");
+}
+
+function statusDetails() {
   const keysLine = [
-    `Telegram: ✅`,
     `Bankr: ${ACTIVE_KEYS.bankr ? "✅" : "❌"}`,
     `Anthropic: ${ACTIVE_KEYS.anthropic ? "✅" : "❌"}`,
     `OpenAI: ${ACTIVE_KEYS.openai ? "✅" : "❌"}`,
@@ -90,7 +89,7 @@ function statusMessage() {
   ].join(" | ");
 
   return [
-    "📊 Status",
+    "📊 Status (details)",
     "",
     `Simulation: ${SIM_ON ? "✅ ON" : "❌ OFF"}`,
     `Sim cash: $${SIM_START_CASH}`,
@@ -100,8 +99,13 @@ function statusMessage() {
     "",
     `Keys: ${keysLine}`,
     "",
-    "Data source: Polymarket Gamma API (public)",
+    `Instance: ${INSTANCE}`,
   ].join("\n");
+}
+
+function statusKeyboard(expanded = false) {
+  if (!expanded) return new InlineKeyboard().text("Show details ▾", "status:more");
+  return new InlineKeyboard().text("Hide details ▴", "status:less");
 }
 
 function helpText() {
@@ -114,22 +118,34 @@ function helpText() {
     "• /markets bitcoin",
     "• /markets eth",
     "• /markets trending",
+    "• /marketsbtc  (alias)",
+    "• /marketseth  (alias)",
     "• /updown btc 5m",
     "• /updown btc 15m",
     "• /updown btc 60m",
   ].join("\n");
 }
 
-// Commands
 bot.command("start", async (ctx) => ctx.reply(helpText()));
 bot.command("ping", async (ctx) => ctx.reply("pong ✅"));
-bot.command("status", async (ctx) => ctx.reply(statusMessage()));
 
-bot.command("markets", async (ctx) => {
-  const text = ctx.message?.text || "";
-  const parts = text.trim().split(/\s+/);
-  const queryRaw = parts.slice(1).join(" ").trim();
+// Status with “dropdown”
+bot.command("status", async (ctx) => {
+  await ctx.reply(statusCompact(), { reply_markup: statusKeyboard(false) });
+});
 
+bot.callbackQuery("status:more", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText(statusDetails(), { reply_markup: statusKeyboard(true) });
+});
+
+bot.callbackQuery("status:less", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText(statusCompact(), { reply_markup: statusKeyboard(false) });
+});
+
+// markets core
+async function handleMarkets(ctx, queryRaw) {
   if (!queryRaw) {
     await ctx.reply("Usage: /markets bitcoin  (or /markets eth /markets trending)");
     return;
@@ -143,6 +159,10 @@ bot.command("markets", async (ctx) => {
   try {
     if (query.toLowerCase() === "trending") {
       const markets = await getTrendingActiveMarkets({ limit: 10 });
+      if (!markets.length) {
+        await ctx.reply("No trending markets returned right now. Try again in a minute.");
+        return;
+      }
       await ctx.reply(formatMarketListMessage("trending", markets));
       return;
     }
@@ -150,7 +170,7 @@ bot.command("markets", async (ctx) => {
     const markets = await searchActiveMarkets(query, { limit: 10 });
     if (!markets.length) {
       await ctx.reply(
-        `No markets found for: ${query}\n\nTry broader terms like:\n• /markets btc\n• /markets crypto\n• /markets price`,
+        `No markets found for: ${query}\n\nTry:\n• /markets crypto\n• /markets election\n• /markets price`,
       );
       return;
     }
@@ -160,7 +180,19 @@ bot.command("markets", async (ctx) => {
     console.error("markets error:", e);
     await ctx.reply("⚠️ markets failed. Check Railway logs for the error.");
   }
+}
+
+bot.command("markets", async (ctx) => {
+  const text = ctx.message?.text || "";
+  const parts = text.trim().split(/\s+/);
+  const queryRaw = parts.slice(1).join(" ").trim();
+  await handleMarkets(ctx, queryRaw);
 });
+
+// Aliases (no space)
+bot.command("marketsbtc", async (ctx) => handleMarkets(ctx, "bitcoin"));
+bot.command("marketseth", async (ctx) => handleMarkets(ctx, "ethereum"));
+bot.command("marketstrending", async (ctx) => handleMarkets(ctx, "trending"));
 
 bot.command("updown", async (ctx) => {
   const text = ctx.message?.text || "";
@@ -201,7 +233,6 @@ bot.command("updown", async (ctx) => {
   }
 });
 
-// Error handling
 bot.catch((err) => {
   const e = err.error;
   console.error("bot.catch =>", err);
@@ -211,7 +242,6 @@ bot.catch((err) => {
   else console.error("Unknown error =>", e);
 });
 
-// Start with 409 retry (keeps bot alive if Telegram briefly conflicts)
 async function startPollingWithRetry() {
   while (true) {
     try {

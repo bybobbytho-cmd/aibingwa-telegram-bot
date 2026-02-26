@@ -1,4 +1,5 @@
 import "dotenv/config";
+import http from "node:http";
 import { Bot } from "grammy";
 import {
   searchActiveMarkets,
@@ -10,6 +11,8 @@ import {
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) throw new Error("Missing TELEGRAM_BOT_TOKEN");
+
+const PORT = Number(process.env.PORT || 3000);
 
 const AI_ENABLED = String(process.env.AI_ENABLED || "false").toLowerCase() === "true";
 const AI_MODEL = process.env.AI_MODEL || "unset";
@@ -23,75 +26,72 @@ const INSTANCE =
 
 const bot = new Bot(token);
 
-function helpText() {
-  return [
-    "Bot is live ✅",
-    "",
-    `Mode: ${MODE}`,
-    `AI: ${AI_ENABLED ? "on" : "off"}`,
-    `AI_MODEL: ${AI_MODEL}`,
-    `Instance: ${INSTANCE}`,
-    "",
-    "Commands:",
-    "• /ping",
-    "• /status",
-    "• /markets bitcoin",
-    "• /markets eth",
-    "• /markets trending",
-    "• /updown btc 5m",
-    "• /updown btc 15m",
-    "• /updown btc 60m",
-    "• /debug_poll (prints getUpdates result to Railway logs)",
-  ].join("\n");
+function json(res, code, obj) {
+  res.writeHead(code, { "content-type": "application/json" });
+  res.end(JSON.stringify(obj));
 }
 
+// ---- 1) Tiny HTTP server (proves app is alive on Railway) ----
+const server = http.createServer(async (req, res) => {
+  if (req.url === "/health") {
+    return json(res, 200, { ok: true, instance: INSTANCE, mode: MODE, ai: AI_ENABLED, ai_model: AI_MODEL });
+  }
+  if (req.url === "/telegram-check") {
+    try {
+      const me = await bot.api.getMe();
+      return json(res, 200, { ok: true, me, instance: INSTANCE });
+    } catch (e) {
+      return json(res, 500, { ok: false, error: String(e?.message || e), instance: INSTANCE });
+    }
+  }
+  return json(res, 404, { ok: false, message: "not found" });
+});
+
+server.listen(PORT, () => {
+  console.log("HTTP server ✅", { port: PORT, instance: INSTANCE });
+});
+
+// ---- Telegram helpers ----
 async function tgGet(path) {
   const url = `https://api.telegram.org/bot${token}/${path}`;
   const res = await fetch(url, { method: "GET" });
   const json = await res.json().catch(() => null);
-  if (!res.ok || !json?.ok) {
-    throw new Error(`Telegram API failed for ${path}: ${JSON.stringify(json).slice(0, 400)}`);
-  }
-  return json;
+  return { status: res.status, json };
 }
 
+// Clears webhook so polling works
 async function ensurePollingMode() {
-  try {
-    const del = await tgGet("setWebhook?url=");
-    console.log("Telegram setWebhook?url= =>", del);
-  } catch (e) {
-    console.log("Webhook delete failed:", e?.message || e);
-  }
+  const del = await tgGet("setWebhook?url=");
+  console.log("Telegram setWebhook?url= =>", del);
 
-  try {
-    const info = await tgGet("getWebhookInfo");
-    console.log("Telegram getWebhookInfo =>", info);
-    const url = info?.result?.url;
-    if (typeof url === "string" && url.length > 0) {
-      console.log("⚠️ Webhook still set to:", url);
-    } else {
-      console.log("✅ Webhook cleared. Polling should work.");
-    }
-  } catch (e) {
-    console.log("getWebhookInfo failed:", e?.message || e);
-  }
+  const info = await tgGet("getWebhookInfo");
+  console.log("Telegram getWebhookInfo =>", info);
 }
 
+// Key diagnostic: are updates queued at Telegram?
+async function logUpdateQueueSnapshot() {
+  const snap = await tgGet("getUpdates?limit=5&timeout=0");
+  const result = Array.isArray(snap?.json?.result) ? snap.json.result : [];
+  const summaries = result.map((u) => ({
+    update_id: u.update_id,
+    text: u.message?.text,
+    chat_id: u.message?.chat?.id,
+    from: u.message?.from?.username,
+  }));
+  console.log("Telegram getUpdates snapshot =>", { status: snap.status, ok: snap.json?.ok, count: summaries.length, summaries });
+}
+
+// ---- 2) Log bot identity at startup ----
 async function logBotIdentity() {
   try {
     const me = await bot.api.getMe();
-    console.log("✅ TOKEN BOT IDENTITY =>", {
-      id: me.id,
-      username: me.username,
-      first_name: me.first_name,
-      instance: INSTANCE,
-    });
+    console.log("✅ TOKEN BOT IDENTITY =>", { id: me.id, username: me.username, first_name: me.first_name, instance: INSTANCE });
   } catch (e) {
-    console.log("❌ getMe failed.", e?.message || e);
+    console.log("❌ getMe failed:", e?.message || e);
   }
 }
 
-// DEBUG: log anything that reaches grammy
+// ---- 3) Log any message that reaches grammy ----
 bot.on("message", async (ctx) => {
   const msg = ctx.message;
   console.log("INCOMING MESSAGE ✅", {
@@ -105,7 +105,7 @@ bot.on("message", async (ctx) => {
 });
 
 bot.command("start", async (ctx) => {
-  await ctx.reply(helpText());
+  await ctx.reply("Bot is live ✅\nTry /ping");
 });
 
 bot.command("ping", async (ctx) => {
@@ -122,31 +122,15 @@ bot.command("status", async (ctx) => {
       `Instance: ${INSTANCE}`,
       "",
       "Data source: Gamma API (public)",
-      "Polling: ON (webhook cleared at startup)",
+      "Polling: ON",
     ].join("\n"),
   );
 });
 
-// NEW: direct Telegram getUpdates probe (prints to Railway logs)
 bot.command("debug_poll", async (ctx) => {
   await ctx.reply("🧪 Running getUpdates probe… check Railway logs.");
-
-  try {
-    const r = await tgGet("getUpdates?limit=5&timeout=0");
-    // Print only summaries (avoid huge logs)
-    const summaries = (r.result || []).map((u) => ({
-      update_id: u.update_id,
-      message_text: u.message?.text,
-      chat_id: u.message?.chat?.id,
-      from_username: u.message?.from?.username,
-    }));
-    console.log("DEBUG getUpdates =>", { count: summaries.length, summaries });
-
-    await ctx.reply(`✅ getUpdates returned ${summaries.length} updates (see Railway logs).`);
-  } catch (e) {
-    console.log("DEBUG getUpdates failed =>", e?.message || e);
-    await ctx.reply("❌ getUpdates probe failed. Check Railway logs.");
-  }
+  await logUpdateQueueSnapshot();
+  await ctx.reply("✅ Probe complete (see Railway logs).");
 });
 
 bot.command("markets", async (ctx) => {
@@ -154,33 +138,24 @@ bot.command("markets", async (ctx) => {
   const parts = text.trim().split(/\s+/);
   const queryRaw = parts.slice(1).join(" ").trim();
 
-  if (!queryRaw) {
-    await ctx.reply("Usage: /markets bitcoin  (or /markets eth /markets trending)");
-    return;
-  }
+  if (!queryRaw) return ctx.reply("Usage: /markets bitcoin");
 
   const qLower = queryRaw.toLowerCase();
   const query = qLower === "btc" ? "bitcoin" : qLower === "eth" ? "ethereum" : queryRaw;
 
   await ctx.reply("🔎 Fetching LIVE markets from Polymarket (Gamma API)...");
-
   try {
     if (query.toLowerCase() === "trending") {
       const markets = await getTrendingActiveMarkets({ limit: 10 });
-      await ctx.reply(formatMarketListMessage("trending", markets));
-      return;
+      return ctx.reply(formatMarketListMessage("trending", markets));
     }
 
     const markets = await searchActiveMarkets(query, { limit: 10 });
-    if (!markets.length) {
-      await ctx.reply(`No active markets found for: ${query}`);
-      return;
-    }
-
-    await ctx.reply(formatMarketListMessage(query, markets));
-  } catch (err) {
-    console.error("markets error:", err);
-    await ctx.reply("⚠️ Failed to fetch markets. Check Railway logs for details.");
+    if (!markets.length) return ctx.reply(`No active markets found for: ${query}`);
+    return ctx.reply(formatMarketListMessage(query, markets));
+  } catch (e) {
+    console.error("markets error:", e);
+    return ctx.reply("⚠️ markets failed (see Railway logs).");
   }
 });
 
@@ -191,48 +166,29 @@ bot.command("updown", async (ctx) => {
   const asset = (parts[1] || "").toLowerCase();
   const horizon = (parts[2] || "").toLowerCase();
 
-  if (!asset || !horizon) {
-    await ctx.reply("Usage: /updown btc 5m  (also 15m, 60m)");
-    return;
-  }
-
-  if (!["btc", "eth", "bitcoin", "ethereum"].includes(asset)) {
-    await ctx.reply("Supported assets for now: btc, eth");
-    return;
-  }
-
-  if (!["5m", "15m", "60m"].includes(horizon)) {
-    await ctx.reply("Supported horizons: 5m, 15m, 60m");
-    return;
-  }
+  if (!asset || !horizon) return ctx.reply("Usage: /updown btc 5m");
 
   const normalizedAsset = asset === "bitcoin" ? "btc" : asset === "ethereum" ? "eth" : asset;
 
-  await ctx.reply("📈 Searching LIVE Up/Down market on Polymarket...");
-
+  await ctx.reply("📈 Searching LIVE Up/Down market...");
   try {
     const result = await findBestUpDownMarket(normalizedAsset, horizon);
-    if (!result) {
-      await ctx.reply("No matching Up/Down market found right now. Try /markets bitcoin");
-      return;
-    }
-    await ctx.reply(formatUpDownMessage(result, normalizedAsset, horizon));
-  } catch (err) {
-    console.error("updown error:", err);
-    await ctx.reply("⚠️ Failed to fetch Up/Down market. Check Railway logs for details.");
+    if (!result) return ctx.reply("No matching Up/Down market found right now.");
+    return ctx.reply(formatUpDownMessage(result, normalizedAsset, horizon));
+  } catch (e) {
+    console.error("updown error:", e);
+    return ctx.reply("⚠️ updown failed (see Railway logs).");
   }
 });
 
-bot.catch((err) => {
-  console.error("bot error:", err);
-});
+bot.catch((err) => console.error("bot error:", err));
 
 console.log("Boot ✅", { MODE, AI_ENABLED, AI_MODEL, INSTANCE });
 
+// Startup diagnostics
 await ensurePollingMode();
 await logBotIdentity();
+await logUpdateQueueSnapshot();
 
 console.log("Bot running ✅ (polling)", { INSTANCE });
 bot.start();
-
-

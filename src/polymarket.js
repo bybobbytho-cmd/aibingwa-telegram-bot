@@ -19,9 +19,8 @@ async function gammaGet(path, params) {
 
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`Gamma API error ${res.status} for ${url} :: ${body.slice(0, 300)}`);
+    throw new Error(`Gamma API error ${res.status} for ${url} :: ${body.slice(0, 250)}`);
   }
-
   return res.json();
 }
 
@@ -59,6 +58,11 @@ function isLiveMarket(m) {
   return active === true && closed === false && archived !== true && restricted !== true;
 }
 
+function safeNum(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : null;
+}
+
 function normalizePrices(m) {
   const outcomesRaw = m?.outcomes;
   const outcomePricesRaw = m?.outcomePrices;
@@ -81,11 +85,6 @@ function normalizePrices(m) {
   return { outcomes, prices };
 }
 
-function safeNum(x) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : null;
-}
-
 function marketUrl(m) {
   const slug = m?.slug || m?.eventSlug;
   if (!slug) return null;
@@ -94,7 +93,6 @@ function marketUrl(m) {
 
 export async function searchActiveMarkets(query, { limit = 10 } = {}) {
   const payload = await gammaGet("/public-search", { q: query });
-
   const all = flattenMarketsFromPublicSearch(payload);
   const live = all.filter(isLiveMarket);
 
@@ -165,26 +163,26 @@ export async function findBestUpDownMarket(asset, horizon) {
   ];
 
   let candidates = [];
-
   for (const q of queries) {
     const payload = await gammaGet("/public-search", { q });
     const markets = flattenMarketsFromPublicSearch(payload).filter(isLiveMarket);
     candidates = candidates.concat(markets);
-    if (candidates.length >= 20) break;
+    if (candidates.length >= 25) break;
   }
 
-  const byId = new Map();
+  const uniqueBySlug = new Map();
   for (const m of candidates) {
-    const id = m?.id || m?.conditionId || `${m?.slug || ""}-${m?.questionID || ""}`;
-    if (!id) continue;
-    if (!byId.has(id)) byId.set(id, m);
+    const key = m?.slug || m?.conditionId || m?.id;
+    if (!key) continue;
+    if (!uniqueBySlug.has(key)) uniqueBySlug.set(key, m);
   }
-  const unique = [...byId.values()];
+
+  const unique = [...uniqueBySlug.values()];
 
   function score(m) {
     const text = `${m?.question || ""} ${m?.title || ""} ${m?.eventTitle || ""}`.toLowerCase();
-
     let s = 0;
+
     if (text.includes(assetName.toLowerCase())) s += 4;
 
     if (horizon === "5m" && (text.includes("5 minute") || text.includes("5-minute") || text.includes("5m"))) s += 4;
@@ -214,7 +212,8 @@ export function formatMarketListMessage(query, markets) {
   lines.push(`📌 Live markets for: ${query}`);
   lines.push("");
 
-  markets.forEach((m, i) => {
+  for (let i = 0; i < markets.length; i++) {
+    const m = markets[i];
     const { outcomes, prices } = normalizePrices(m);
 
     const title = m?.question || m?.title || m?.eventTitle || "Untitled market";
@@ -222,25 +221,23 @@ export function formatMarketListMessage(query, markets) {
 
     const vol = safeNum(m?.volume) ?? safeNum(m?.eventVolume);
     const liq = safeNum(m?.liquidity) ?? safeNum(m?.eventLiquidity);
-    const end = m?.endDate || m?.eventEndDate || m?.upperBoundDate || null;
 
     const priceLine =
       outcomes.length && prices.length
         ? outcomes
             .map((o, idx) => {
-              const p = prices[idx];
-              const pn = safeNum(p);
-              return pn === null ? `${o}: ?` : `${o}: ${(pn * 100).toFixed(1)}%`;
+              const p = safeNum(prices[idx]);
+              return p === null ? `${o}: ?` : `${o}: ${(p * 100).toFixed(1)}%`;
             })
             .join(" | ")
         : "Prices: (not available in this response)";
 
     lines.push(`${i + 1}) ${title}`);
     lines.push(`   ${priceLine}`);
-    lines.push(`   Vol: ${vol ?? "?"}  | Liq: ${liq ?? "?"}${end ? `  | Ends: ${end}` : ""}`);
+    lines.push(`   Vol: ${vol ?? "?"} | Liq: ${liq ?? "?"}`);
     if (url) lines.push(`   ${url}`);
     lines.push("");
-  });
+  }
 
   return lines.join("\n");
 }

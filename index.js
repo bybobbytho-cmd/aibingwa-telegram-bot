@@ -18,23 +18,23 @@ const MODE_RAW = String(process.env.MODE || "SIMULATION").toUpperCase();
 const SIM_ON = MODE_RAW === "SIM" || MODE_RAW === "SIMULATION";
 const SIM_START_CASH = Number(process.env.SIM_START_CASH || 50);
 
-const INSTANCE =
-  process.env.RAILWAY_REPLICA_ID ||
-  process.env.RAILWAY_SERVICE_ID ||
-  process.env.HOSTNAME ||
-  "unknown";
-
 function keyOn(name) {
   const v = process.env[name];
   return typeof v === "string" && v.trim().length > 0;
 }
 
-const ACTIVE_KEYS = {
+const KEYS = {
   bankr: keyOn("BANKR_API_KEY"),
   anthropic: keyOn("ANTHROPIC_API_KEY"),
   openai: keyOn("OPENAI_API_KEY"),
   gemini: keyOn("GEMINI_API_KEY") || keyOn("GOOGLE_API_KEY"),
 };
+
+const INSTANCE =
+  process.env.RAILWAY_REPLICA_ID ||
+  process.env.RAILWAY_SERVICE_ID ||
+  process.env.HOSTNAME ||
+  "unknown";
 
 const bot = new Bot(token);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -64,28 +64,29 @@ async function logIdentity() {
       id: me.id,
       username: me.username,
       first_name: me.first_name,
-      instance: INSTANCE,
+      instance: INSTANCE, // log-only, not shown to user
     });
   } catch (e) {
     console.log("❌ getMe failed:", e?.message || e);
   }
 }
 
+// ----- STATUS UI (compact + “dropdown” button) -----
 function statusCompact() {
   return [
     "📊 Status",
-    `Simulation: ${SIM_ON ? "✅ ON" : "❌ OFF"} | Cash: $${SIM_START_CASH}`,
-    `AI: ${AI_ENABLED ? "✅ ON" : "❌ OFF"} | Model: ${AI_MODEL}`,
-    "Data: Gamma API (public)",
+    `Simulation: ${SIM_ON ? "✅ ON" : "❌ OFF"}   Cash: $${SIM_START_CASH}`,
+    `AI: ${AI_ENABLED ? "✅ ON" : "❌ OFF"}   Model: ${AI_MODEL}`,
+    "Data: Polymarket (Gamma + CLOB reads)",
   ].join("\n");
 }
 
 function statusDetails() {
   const keysLine = [
-    `Bankr: ${ACTIVE_KEYS.bankr ? "✅" : "❌"}`,
-    `Anthropic: ${ACTIVE_KEYS.anthropic ? "✅" : "❌"}`,
-    `OpenAI: ${ACTIVE_KEYS.openai ? "✅" : "❌"}`,
-    `Gemini: ${ACTIVE_KEYS.gemini ? "✅" : "❌"}`,
+    `Bankr: ${KEYS.bankr ? "✅" : "❌"}`,
+    `Anthropic: ${KEYS.anthropic ? "✅" : "❌"}`,
+    `OpenAI: ${KEYS.openai ? "✅" : "❌"}`,
+    `Gemini: ${KEYS.gemini ? "✅" : "❌"}`,
   ].join(" | ");
 
   return [
@@ -97,15 +98,16 @@ function statusDetails() {
     `AI: ${AI_ENABLED ? "✅ ON" : "❌ OFF"}`,
     `AI model: ${AI_MODEL}`,
     "",
-    `Keys: ${keysLine}`,
+    `Keys present: ${keysLine}`,
     "",
-    `Instance: ${INSTANCE}`,
+    "Trading: OFF (data-only)",
   ].join("\n");
 }
 
 function statusKeyboard(expanded = false) {
-  if (!expanded) return new InlineKeyboard().text("Show details ▾", "status:more");
-  return new InlineKeyboard().text("Hide details ▴", "status:less");
+  return expanded
+    ? new InlineKeyboard().text("Hide details ▴", "status:less")
+    : new InlineKeyboard().text("Show details ▾", "status:more");
 }
 
 function helpText() {
@@ -118,8 +120,9 @@ function helpText() {
     "• /markets bitcoin",
     "• /markets eth",
     "• /markets trending",
-    "• /marketsbtc  (alias)",
-    "• /marketseth  (alias)",
+    "• /marketsbtc (alias)",
+    "• /marketseth (alias)",
+    "• /marketstrending (alias)",
     "• /updown btc 5m",
     "• /updown btc 15m",
     "• /updown btc 60m",
@@ -129,7 +132,6 @@ function helpText() {
 bot.command("start", async (ctx) => ctx.reply(helpText()));
 bot.command("ping", async (ctx) => ctx.reply("pong ✅"));
 
-// Status with “dropdown”
 bot.command("status", async (ctx) => {
   await ctx.reply(statusCompact(), { reply_markup: statusKeyboard(false) });
 });
@@ -144,7 +146,7 @@ bot.callbackQuery("status:less", async (ctx) => {
   await ctx.editMessageText(statusCompact(), { reply_markup: statusKeyboard(false) });
 });
 
-// markets core
+// ----- MARKETS -----
 async function handleMarkets(ctx, queryRaw) {
   if (!queryRaw) {
     await ctx.reply("Usage: /markets bitcoin  (or /markets eth /markets trending)");
@@ -154,7 +156,7 @@ async function handleMarkets(ctx, queryRaw) {
   const q = queryRaw.toLowerCase();
   const query = q === "btc" ? "bitcoin" : q === "eth" ? "ethereum" : queryRaw;
 
-  await ctx.reply("🔎 Fetching LIVE markets from Polymarket (Gamma API)…");
+  await ctx.reply("🔎 Fetching markets from Polymarket…");
 
   try {
     if (query.toLowerCase() === "trending") {
@@ -170,7 +172,7 @@ async function handleMarkets(ctx, queryRaw) {
     const markets = await searchActiveMarkets(query, { limit: 10 });
     if (!markets.length) {
       await ctx.reply(
-        `No markets found for: ${query}\n\nTry:\n• /markets crypto\n• /markets election\n• /markets price`,
+        `No markets found for: ${query}\n\nTry:\n• /markets crypto\n• /markets price\n• /markets election`,
       );
       return;
     }
@@ -194,6 +196,7 @@ bot.command("marketsbtc", async (ctx) => handleMarkets(ctx, "bitcoin"));
 bot.command("marketseth", async (ctx) => handleMarkets(ctx, "ethereum"));
 bot.command("marketstrending", async (ctx) => handleMarkets(ctx, "trending"));
 
+// ----- UPDOWN (Gamma discovery now; next step will add CLOB live odds) -----
 bot.command("updown", async (ctx) => {
   const text = ctx.message?.text || "";
   const parts = text.trim().split(/\s+/);
@@ -218,7 +221,7 @@ bot.command("updown", async (ctx) => {
 
   const normalizedAsset = asset === "bitcoin" ? "btc" : asset === "ethereum" ? "eth" : asset;
 
-  await ctx.reply("📈 Searching LIVE Up/Down market on Polymarket…");
+  await ctx.reply("📈 Finding best LIVE Up/Down market…");
 
   try {
     const result = await findBestUpDownMarket(normalizedAsset, horizon);
@@ -233,6 +236,7 @@ bot.command("updown", async (ctx) => {
   }
 });
 
+// ----- Errors -----
 bot.catch((err) => {
   const e = err.error;
   console.error("bot.catch =>", err);
@@ -242,6 +246,7 @@ bot.catch((err) => {
   else console.error("Unknown error =>", e);
 });
 
+// ----- Start (409 retry safe) -----
 async function startPollingWithRetry() {
   while (true) {
     try {

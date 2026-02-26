@@ -13,7 +13,6 @@ function qs(params = {}) {
     u.set(k, String(v));
   }
   const s = u.toString();
-  // IMPORTANT: backticks must stay here:
   return s ? `?${s}` : "";
 }
 
@@ -47,13 +46,6 @@ async function fetchText(url) {
   return text.trim();
 }
 
-export function intervalToSeconds(intervalStr) {
-  const map = { "5m": 300, "15m": 900, "60m": 3600 };
-  const sec = map[String(intervalStr).toLowerCase()];
-  if (!sec) throw new Error(`Unsupported interval: ${intervalStr}`);
-  return sec;
-}
-
 export async function getClobServerTimeSec() {
   const raw = await fetchText(`${CLOB_BASE}/time`);
   const n = Number(raw);
@@ -61,6 +53,10 @@ export async function getClobServerTimeSec() {
   return n > 1e12 ? Math.floor(n / 1000) : Math.floor(n);
 }
 
+/**
+ * CLOB sampling markets:
+ * Docs say it returns { limit, next_cursor, count, data[] }. ([docs.polymarket.com](https://docs.polymarket.com/api-reference/markets/get-sampling-markets))
+ */
 export async function getSamplingMarkets(next_cursor) {
   const url = `${CLOB_BASE}/sampling-markets${qs({ next_cursor })}`;
   return fetchJson(url);
@@ -95,7 +91,6 @@ function looksLikeUpDown(m) {
   const q = normalizeText(m?.question);
   const d = normalizeText(m?.description);
   const s = normalizeText(m?.market_slug);
-
   return (
     (q.includes("up") && q.includes("down")) ||
     (d.includes("up") && d.includes("down")) ||
@@ -160,6 +155,11 @@ function extractUpDownTokens(market) {
   };
 }
 
+function isEndCursor(cursor) {
+  // Your logs show next_cursor="LTE=" which is base64 for "-1" (end).
+  return cursor === "LTE=" || cursor === "-1" || cursor === "" || cursor === null || cursor === undefined;
+}
+
 export async function resolveLiveUpDown(asset, intervalStr) {
   const interval = String(intervalStr).toLowerCase();
   const nowSec = await getClobServerTimeSec();
@@ -167,17 +167,22 @@ export async function resolveLiveUpDown(asset, intervalStr) {
   const assetRx = assetMatchers(asset);
   const intervalRx = intervalMatchers(interval);
 
-  const MAX_PAGES = 6;
+  const MAX_PAGES = 8;
   let cursor = undefined;
   let all = [];
 
   for (let i = 0; i < MAX_PAGES; i++) {
     const page = await getSamplingMarkets(cursor);
+
     const data = Array.isArray(page?.data) ? page.data : [];
     all = all.concat(data);
 
-    cursor = page?.next_cursor || null;
-    if (!cursor) break;
+    const next = page?.next_cursor;
+
+    // ✅ FIX: stop when next_cursor indicates end (LTE= / -1)
+    if (isEndCursor(next)) break;
+
+    cursor = next;
   }
 
   const candidates = all.filter((m) => {

@@ -11,26 +11,38 @@ function qs(params = {}) {
   return s ? `?${s}` : "";
 }
 
-async function getJson(url) {
-  const res = await fetch(url, { headers: { accept: "application/json" } });
+const COMMON_HEADERS = {
+  accept: "application/json",
+  "user-agent":
+    "Mozilla/5.0 (compatible; aibingwa-telegram-bot/1.0; +https://github.com/bybobbytho-cmd/aibingwa-telegram-bot)",
+};
+
+async function fetchText(url) {
+  const res = await fetch(url, { headers: { ...COMMON_HEADERS, accept: "text/plain" } });
+  const t = await res.text().catch(() => "");
   if (!res.ok) {
-    const t = await res.text().catch(() => "");
     const err = new Error(`HTTP ${res.status} ${url} :: ${t.slice(0, 200)}`);
     err.status = res.status;
     throw err;
   }
-  return res.json();
+  return t.trim();
 }
 
-async function getText(url) {
-  const res = await fetch(url, { headers: { accept: "text/plain" } });
+async function fetchJson(url) {
+  const res = await fetch(url, { headers: COMMON_HEADERS });
+  const t = await res.text().catch(() => "");
   if (!res.ok) {
-    const t = await res.text().catch(() => "");
     const err = new Error(`HTTP ${res.status} ${url} :: ${t.slice(0, 200)}`);
     err.status = res.status;
     throw err;
   }
-  return res.text();
+  try {
+    return JSON.parse(t);
+  } catch {
+    const err = new Error(`Invalid JSON from ${url} :: ${t.slice(0, 200)}`);
+    err.status = 500;
+    throw err;
+  }
 }
 
 function safeArrayMaybeJson(v) {
@@ -46,17 +58,6 @@ function safeArrayMaybeJson(v) {
   return [];
 }
 
-/**
- * Uses CLOB /time so our window math matches Polymarket server time.
- * Docs: GET https://clob.polymarket.com/time :contentReference[oaicite:3]{index=3}
- */
-export async function getClobServerTimeSec() {
-  const txt = await getText(`${CLOB_BASE}/time`);
-  const n = Number(txt);
-  if (!Number.isFinite(n)) throw new Error(`Invalid /time response: ${txt}`);
-  return n;
-}
-
 export function intervalToSeconds(intervalStr) {
   const map = { "5m": 300, "15m": 900, "60m": 3600 };
   const sec = map[String(intervalStr).toLowerCase()];
@@ -64,27 +65,53 @@ export function intervalToSeconds(intervalStr) {
   return sec;
 }
 
-export function buildUpDownSlug(asset, intervalStr, windowStartSec) {
-  const a = String(asset).toLowerCase(); // btc or eth
-  const i = String(intervalStr).toLowerCase(); // 5m, 15m, 60m
-  return `${a}-updown-${i}-${windowStartSec}`;
-}
-
-export async function getEventBySlug(slug) {
-  // Docs: GET /events/slug/{slug} :contentReference[oaicite:4]{index=4}
-  const url = `${GAMMA_BASE}/events/slug/${encodeURIComponent(slug)}`;
-  return getJson(url);
+export function buildUpDownSlug(assetName, intervalStr, tsSec) {
+  return `${assetName}-updown-${intervalStr}-${tsSec}`;
 }
 
 /**
- * Extract token IDs for Up/Down from Gamma event object.
- * Typically: event.markets[0].clobTokenIds => ["<UP_TOKEN_ID>", "<DOWN_TOKEN_ID>"] (array or JSON string)
+ * IMPORTANT:
+ * - /time might return seconds OR milliseconds depending on implementation.
+ * We normalize to seconds by:
+ * - if > 1e12 => assume ms, divide by 1000
+ * - else seconds
  */
+export async function getClobServerTimeSec() {
+  const raw = await fetchText(`${CLOB_BASE}/time`);
+  const n = Number(raw);
+  if (!Number.isFinite(n)) {
+    throw new Error(`Invalid CLOB /time response: "${raw}"`);
+  }
+  const sec = n > 1e12 ? Math.floor(n / 1000) : Math.floor(n);
+  return { raw, sec };
+}
+
+/**
+ * Try both documented strategies:
+ * 1) /events/slug/{slug}
+ * 2) /events?slug={slug}
+ */
+export async function getEventBySlug(slug) {
+  try {
+    return await fetchJson(`${GAMMA_BASE}/events/slug/${encodeURIComponent(slug)}`);
+  } catch {
+    const data = await fetchJson(`${GAMMA_BASE}/events${qs({ slug })}`);
+    if (Array.isArray(data)) {
+      if (data.length === 0) {
+        const err = new Error(`Gamma returned empty array for slug=${slug}`);
+        err.status = 404;
+        throw err;
+      }
+      return data[0];
+    }
+    return data;
+  }
+}
+
 export function extractUpDownTokenIdsFromEvent(event) {
   const markets = Array.isArray(event?.markets) ? event.markets : [];
   if (!markets.length) return null;
 
-  // Up/Down events typically have one market with 2 outcomes
   const m = markets[0];
   const tokenIds = safeArrayMaybeJson(m?.clobTokenIds);
 
@@ -93,99 +120,112 @@ export function extractUpDownTokenIdsFromEvent(event) {
   return {
     upTokenId: String(tokenIds[0]),
     downTokenId: String(tokenIds[1]),
-    market: m,
   };
 }
 
 export async function getClobPrices(tokenIds) {
-  // Docs: GET /prices (multiple token IDs) :contentReference[oaicite:5]{index=5}
-  // Most deployments accept comma-separated token_ids.
   const token_ids = tokenIds.join(",");
-  const url = `${CLOB_BASE}/prices${qs({ token_ids })}`;
-  return getJson(url); // returns map: { [tokenId]: price }
+  return fetchJson(`${CLOB_BASE}/prices${qs({ token_ids })}`);
 }
 
 /**
- * The deterministic pipeline:
- * 1) get CLOB server time
- * 2) compute window start
- * 3) build slug (btc-updown-15m-<ts>)
- * 4) fetch Gamma event by slug
- * 5) extract clobTokenIds
- * 6) fetch live odds from CLOB /prices
- *
- * Resilience:
- * - if exact window isn’t ready (race at boundary), try previous window
+ * Robust resolver:
+ * - uses CLOB /time normalized seconds
+ * - tries timestamps: start, start-interval, start+interval
+ * - tries asset names: btc + bitcoin, eth + ethereum
  */
 export async function resolveLiveUpDown(asset, intervalStr) {
-  const assetNorm = String(asset).toLowerCase(); // btc / eth
-  const seconds = intervalToSeconds(intervalStr);
+  const interval = String(intervalStr).toLowerCase();
+  const seconds = intervalToSeconds(interval);
 
-  const serverNow = await getClobServerTimeSec();
-  const windowStart = Math.floor(serverNow / seconds) * seconds;
+  const assetLower = String(asset).toLowerCase();
+  const assetNames =
+    assetLower === "btc"
+      ? ["btc", "bitcoin"]
+      : assetLower === "eth"
+        ? ["eth", "ethereum"]
+        : [assetLower];
 
-  const candidates = [
-    buildUpDownSlug(assetNorm, intervalStr, windowStart),
-    buildUpDownSlug(assetNorm, intervalStr, windowStart - seconds), // fallback if boundary not indexed yet
-  ];
+  const { raw: timeRaw, sec: serverNowSec } = await getClobServerTimeSec();
+  const windowStart = Math.floor(serverNowSec / seconds) * seconds;
 
+  const tsCandidates = [windowStart, windowStart - seconds, windowStart + seconds];
+
+  const slugsTried = [];
   let lastErr = null;
 
-  for (const slug of candidates) {
-    try {
-      const event = await getEventBySlug(slug);
-      const extracted = extractUpDownTokenIdsFromEvent(event);
-      if (!extracted) {
-        throw new Error(`Event found but clobTokenIds missing for slug=${slug}`);
+  for (const name of assetNames) {
+    for (const ts of tsCandidates) {
+      const slug = buildUpDownSlug(name, interval, ts);
+      slugsTried.push(slug);
+      try {
+        const event = await getEventBySlug(slug);
+        const tokens = extractUpDownTokenIdsFromEvent(event);
+        if (!tokens) throw new Error(`No clobTokenIds on event for slug=${slug}`);
+
+        const prices = await getClobPrices([tokens.upTokenId, tokens.downTokenId]);
+
+        const up = Number(prices?.[tokens.upTokenId]);
+        const down = Number(prices?.[tokens.downTokenId]);
+
+        return {
+          ok: true,
+          slug,
+          title: event?.title || slug,
+          upPrice: Number.isFinite(up) ? up : null,
+          downPrice: Number.isFinite(down) ? down : null,
+          debug: {
+            timeRaw,
+            serverNowSec,
+            seconds,
+            windowStart,
+            slugsTried,
+          },
+        };
+      } catch (e) {
+        lastErr = e;
       }
-
-      const { upTokenId, downTokenId } = extracted;
-      const prices = await getClobPrices([upTokenId, downTokenId]);
-
-      const up = Number(prices?.[upTokenId]);
-      const down = Number(prices?.[downTokenId]);
-
-      return {
-        ok: true,
-        slug,
-        title: event?.title || event?.ticker || slug,
-        upTokenId,
-        downTokenId,
-        upPrice: Number.isFinite(up) ? up : null, // 0..1
-        downPrice: Number.isFinite(down) ? down : null, // 0..1
-        event,
-      };
-    } catch (e) {
-      lastErr = e;
-      continue;
     }
   }
 
   return {
     ok: false,
-    error: lastErr?.message || "Failed to resolve Up/Down market",
-    debug: { asset: assetNorm, intervalStr, tried: candidates },
+    error: lastErr?.message || "No active markets found in candidate windows",
+    debug: {
+      timeRaw,
+      serverNowSec,
+      seconds,
+      windowStart,
+      slugsTried,
+    },
   };
 }
 
-// Simple formatter (no Markdown needed)
 export function formatUpDownLiveMessage(res, asset, intervalStr) {
+  const interval = String(intervalStr).toLowerCase();
+
   if (!res?.ok) {
     return [
       `❌ Up/Down market not found yet.`,
-      `Asset: ${asset.toUpperCase()} | Interval: ${intervalStr}`,
-      `Tried: ${res?.debug?.tried?.join(" , ") || "?"}`,
-      `Tip: if you run this on the exact boundary, try again in ~10 seconds.`,
+      `Asset: ${asset.toUpperCase()} | Interval: ${interval}`,
+      "",
+      `CLOB /time raw: ${res?.debug?.timeRaw ?? "?"}`,
+      `CLOB /time sec: ${res?.debug?.serverNowSec ?? "?"}`,
+      `Computed windowStart: ${res?.debug?.windowStart ?? "?"}`,
+      "",
+      `Tried slugs:`,
+      ...(res?.debug?.slugsTried || []).map((s) => `- ${s}`),
+      "",
+      `Last error: ${res?.error || "unknown"}`,
     ].join("\n");
   }
 
   const upPct = res.upPrice === null ? "?" : (res.upPrice * 100).toFixed(1) + "%";
   const downPct = res.downPrice === null ? "?" : (res.downPrice * 100).toFixed(1) + "%";
-
   const url = `https://polymarket.com/event/${res.slug}`;
 
   return [
-    `📈 Up/Down LIVE (${asset.toUpperCase()} ${intervalStr})`,
+    `📈 Up/Down LIVE (${asset.toUpperCase()} ${interval})`,
     res.title,
     "",
     `UP: ${upPct}`,

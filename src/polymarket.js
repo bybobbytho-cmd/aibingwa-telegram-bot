@@ -1,5 +1,10 @@
-const GAMMA_BASE = "https://gamma-api.polymarket.com";
 const CLOB_BASE = "https://clob.polymarket.com";
+
+const COMMON_HEADERS = {
+  accept: "application/json",
+  "user-agent":
+    "Mozilla/5.0 (compatible; aibingwa-telegram-bot/1.0; +https://github.com/bybobbytho-cmd/aibingwa-telegram-bot)",
+};
 
 function qs(params = {}) {
   const u = new URLSearchParams();
@@ -8,196 +13,278 @@ function qs(params = {}) {
     u.set(k, String(v));
   }
   const s = u.toString();
-  return s ? `?${s}` : "";
-}
-
-const COMMON_HEADERS = {
-  accept: "application/json",
-  "user-agent":
-    "Mozilla/5.0 (compatible; aibingwa-telegram-bot/1.0; +https://github.com/bybobbytho-cmd/aibingwa-telegram-bot)",
-};
-
-async function fetchText(url) {
-  const res = await fetch(url, { headers: { ...COMMON_HEADERS, accept: "text/plain" } });
-  const t = await res.text().catch(() => "");
-  if (!res.ok) {
-    const err = new Error(`HTTP ${res.status} ${url} :: ${t.slice(0, 200)}`);
-    err.status = res.status;
-    throw err;
-  }
-  return t.trim();
+  return s ? ?${s} : "";
 }
 
 async function fetchJson(url) {
   const res = await fetch(url, { headers: COMMON_HEADERS });
-  const t = await res.text().catch(() => "");
+  const text = await res.text().catch(() => "");
   if (!res.ok) {
-    const err = new Error(`HTTP ${res.status} ${url} :: ${t.slice(0, 200)}`);
+    const err = new Error(HTTP ${res.status} ${url} :: ${text.slice(0, 250)});
     err.status = res.status;
     throw err;
   }
   try {
-    return JSON.parse(t);
+    return JSON.parse(text);
   } catch {
-    const err = new Error(`Invalid JSON from ${url} :: ${t.slice(0, 200)}`);
+    const err = new Error(Invalid JSON from ${url} :: ${text.slice(0, 250)});
     err.status = 500;
     throw err;
   }
 }
 
-function safeArrayMaybeJson(v) {
-  if (Array.isArray(v)) return v;
-  if (typeof v === "string") {
-    try {
-      const parsed = JSON.parse(v);
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
-    }
+async function fetchText(url) {
+  const res = await fetch(url, {
+    headers: { ...COMMON_HEADERS, accept: "text/plain" },
+  });
+  const text = await res.text().catch(() => "");
+  if (!res.ok) {
+    const err = new Error(HTTP ${res.status} ${url} :: ${text.slice(0, 250)});
+    err.status = res.status;
+    throw err;
   }
-  return [];
+  return text.trim();
 }
 
 export function intervalToSeconds(intervalStr) {
   const map = { "5m": 300, "15m": 900, "60m": 3600 };
   const sec = map[String(intervalStr).toLowerCase()];
-  if (!sec) throw new Error(`Unsupported interval: ${intervalStr}`);
+  if (!sec) throw new Error(Unsupported interval: ${intervalStr});
   return sec;
 }
 
-export function buildUpDownSlug(assetName, intervalStr, tsSec) {
-  return `${assetName}-updown-${intervalStr}-${tsSec}`;
-}
-
-/**
- * IMPORTANT:
- * - /time might return seconds OR milliseconds depending on implementation.
- * We normalize to seconds by:
- * - if > 1e12 => assume ms, divide by 1000
- * - else seconds
- */
 export async function getClobServerTimeSec() {
-  const raw = await fetchText(`${CLOB_BASE}/time`);
+  // CLOB time endpoint exists and returns a numeric timestamp.  [oai_citation:2‡Polymarket Documentation](https://docs.polymarket.com/resources/error-codes?utm_source=chatgpt.com)
+  const raw = await fetchText(${CLOB_BASE}/time);
   const n = Number(raw);
-  if (!Number.isFinite(n)) {
-    throw new Error(`Invalid CLOB /time response: "${raw}"`);
-  }
-  const sec = n > 1e12 ? Math.floor(n / 1000) : Math.floor(n);
-  return { raw, sec };
+  if (!Number.isFinite(n)) throw new Error(Invalid /time response: "${raw}");
+  // normalize ms -> sec if needed
+  return n > 1e12 ? Math.floor(n / 1000) : Math.floor(n);
 }
 
 /**
- * Try both documented strategies:
- * 1) /events/slug/{slug}
- * 2) /events?slug={slug}
+ * CLOB sampling markets:
+ * GET https://clob.polymarket.com/sampling-markets
+ * Response includes question, description, market_slug, end_date_iso, tokens[{token_id,outcome,price}], etc.  [oai_citation:3‡Polymarket Documentation](https://docs.polymarket.com/api-reference/markets/get-sampling-markets)
  */
-export async function getEventBySlug(slug) {
-  try {
-    return await fetchJson(`${GAMMA_BASE}/events/slug/${encodeURIComponent(slug)}`);
-  } catch {
-    const data = await fetchJson(`${GAMMA_BASE}/events${qs({ slug })}`);
-    if (Array.isArray(data)) {
-      if (data.length === 0) {
-        const err = new Error(`Gamma returned empty array for slug=${slug}`);
-        err.status = 404;
-        throw err;
-      }
-      return data[0];
-    }
-    return data;
-  }
+export async function getSamplingMarkets(next_cursor) {
+  const url = ${CLOB_BASE}/sampling-markets${qs({ next_cursor })};
+  return fetchJson(url);
 }
 
-export function extractUpDownTokenIdsFromEvent(event) {
-  const markets = Array.isArray(event?.markets) ? event.markets : [];
-  if (!markets.length) return null;
+/**
+ * CLOB prices endpoint exists; we use it to confirm token prices if needed.
+ * (Docs show multiple market data endpoints including prices.)  [oai_citation:4‡Polymarket Documentation](https://docs.polymarket.com/resources/error-codes?utm_source=chatgpt.com)
+ */
+export async function getClobPrices(tokenIds) {
+  const token_ids = tokenIds.join(",");
+  const url = ${CLOB_BASE}/prices${qs({ token_ids })};
+  return fetchJson(url);
+}
 
-  const m = markets[0];
-  const tokenIds = safeArrayMaybeJson(m?.clobTokenIds);
+function normalizeText(s) {
+  return String(s || "").toLowerCase();
+}
 
-  if (tokenIds.length < 2) return null;
+function intervalMatchers(intervalStr) {
+  const i = String(intervalStr).toLowerCase();
+  if (i === "5m") {
+    return [
+      /5\s*min/i,
+      /5\s*minute/i,
+      /\b5m\b/i,
+      /-5m-/i,
+    ];
+  }
+  if (i === "15m") {
+    return [
+      /15\s*min/i,
+      /15\s*minute/i,
+      /\b15m\b/i,
+      /-15m-/i,
+    ];
+  }
+  if (i === "60m") {
+    return [
+      /60\s*min/i,
+      /60\s*minute/i,
+      /1\s*hour/i,
+      /\b60m\b/i,
+      /-60m-/i,
+    ];
+  }
+  return [];
+}
 
+function assetMatchers(asset) {
+  const a = String(asset).toLowerCase();
+  if (a === "btc" || a === "bitcoin") return [/btc/i, /bitcoin/i];
+  if (a === "eth" || a === "ethereum") return [/eth/i, /ethereum/i];
+  return [new RegExp(a, "i")];
+}
+
+function looksLikeUpDown(m) {
+  const q = normalizeText(m?.question);
+  const d = normalizeText(m?.description);
+  const s = normalizeText(m?.market_slug);
+
+  // We want the rolling Up/Down markets
+  return (
+    q.includes("up") && q.includes("down") ||
+    d.includes("up") && d.includes("down") ||
+    s.includes("updown") ||
+    q.includes("up/down") ||
+    d.includes("up/down")
+  );
+}
+
+function marketIsTradeable(m) {
+  // sampling-markets includes these fields  [oai_citation:5‡Polymarket Documentation](https://docs.polymarket.com/api-reference/markets/get-sampling-markets)
+  return (
+    m?.enable_order_book === true &&
+    m?.active === true &&
+    m?.accepting_orders === true &&
+    m?.closed !== true &&
+    m?.archived !== true
+  );
+}
+
+function parseIsoToSec(iso) {
+  const t = Date.parse(iso);
+  return Number.isFinite(t) ? Math.floor(t / 1000) : null;
+}
+
+function pickCurrentWindowMarket(candidates, nowSec) {
+  // Prefer the soonest end_date_iso that is still in the future (the current live window).
+  let best = null;
+  let bestDelta = Infinity;
+
+  for (const m of candidates) {
+    const endSec = parseIsoToSec(m?.end_date_iso);
+    if (!endSec) continue;
+    const delta = endSec - nowSec;
+    if (delta > 0 && delta < bestDelta) {
+      best = m;
+      bestDelta = delta;
+    }
+  }
+
+  // If none are “future”, fall back to first candidate
+  return best || candidates[0] || null;
+}
+
+function extractUpDownTokens(market) {
+  const tokens = Array.isArray(market?.tokens) ? market.tokens : [];
+  if (tokens.length < 2) return null;
+
+  // Best case: outcomes literally include "Up" and "Down"
+  const up = tokens.find((t) => normalizeText(t?.outcome).includes("up"));
+  const down = tokens.find((t) => normalizeText(t?.outcome).includes("down"));
+
+  if (up && down) {
+    return {
+      upTokenId: String(up.token_id),
+      downTokenId: String(down.token_id),
+      upPrice: typeof up.price === "number" ? up.price : Number(up.price),
+      downPrice: typeof down.price === "number" ? down.price : Number(down.price),
+    };
+  }
+
+  // Fallback: use first two tokens
   return {
-    upTokenId: String(tokenIds[0]),
-    downTokenId: String(tokenIds[1]),
+    upTokenId: String(tokens[0].token_id),
+    downTokenId: String(tokens[1].token_id),
+    upPrice: typeof tokens[0].price === "number" ? tokens[0].price : Number(tokens[0].price),
+    downPrice: typeof tokens[1].price === "number" ? tokens[1].price : Number(tokens[1].price),
   };
 }
 
-export async function getClobPrices(tokenIds) {
-  const token_ids = tokenIds.join(",");
-  return fetchJson(`${CLOB_BASE}/prices${qs({ token_ids })}`);
-}
-
 /**
- * Robust resolver:
- * - uses CLOB /time normalized seconds
- * - tries timestamps: start, start-interval, start+interval
- * - tries asset names: btc + bitcoin, eth + ethereum
+ * The FIX:
+ * Discover Up/Down markets via CLOB sampling-markets (NOT Gamma).
+ * - Pull a few pages
+ * - Filter for asset + interval + up/down
+ * - Pick current window via end_date_iso closest in the future
+ * - Read prices from tokens or confirm via /prices
  */
 export async function resolveLiveUpDown(asset, intervalStr) {
   const interval = String(intervalStr).toLowerCase();
-  const seconds = intervalToSeconds(interval);
+  const nowSec = await getClobServerTimeSec();
 
-  const assetLower = String(asset).toLowerCase();
-  const assetNames =
-    assetLower === "btc"
-      ? ["btc", "bitcoin"]
-      : assetLower === "eth"
-        ? ["eth", "ethereum"]
-        : [assetLower];
+  const assetRx = assetMatchers(asset);
+  const intervalRx = intervalMatchers(interval);
 
-  const { raw: timeRaw, sec: serverNowSec } = await getClobServerTimeSec();
-  const windowStart = Math.floor(serverNowSec / seconds) * seconds;
+  const MAX_PAGES = 6; // keep it light
+  let cursor = undefined;
+  let all = [];
 
-  const tsCandidates = [windowStart, windowStart - seconds, windowStart + seconds];
+  for (let i = 0; i < MAX_PAGES; i++) {
+    const page = await getSamplingMarkets(cursor);
+    const data = Array.isArray(page?.data) ? page.data : [];
+    all = all.concat(data);
 
-  const slugsTried = [];
-  let lastErr = null;
+    cursor = page?.next_cursor || null;
+    if (!cursor) break;
+  }
 
-  for (const name of assetNames) {
-    for (const ts of tsCandidates) {
-      const slug = buildUpDownSlug(name, interval, ts);
-      slugsTried.push(slug);
-      try {
-        const event = await getEventBySlug(slug);
-        const tokens = extractUpDownTokenIdsFromEvent(event);
-        if (!tokens) throw new Error(`No clobTokenIds on event for slug=${slug}`);
+  // Filter aggressively
+  const candidates = all.filter((m) => {
+    if (!marketIsTradeable(m)) return false;
+    if (!looksLikeUpDown(m)) return false;
 
-        const prices = await getClobPrices([tokens.upTokenId, tokens.downTokenId]);
+    const blob = ${m?.question || ""} ${m?.description || ""} ${m?.market_slug || ""};
+    const assetOk = assetRx.some((rx) => rx.test(blob));
+    if (!assetOk) return false;
 
-        const up = Number(prices?.[tokens.upTokenId]);
-        const down = Number(prices?.[tokens.downTokenId]);
+    const intervalOk = intervalRx.length
+      ? intervalRx.some((rx) => rx.test(blob))
+      : true;
 
-        return {
-          ok: true,
-          slug,
-          title: event?.title || slug,
-          upPrice: Number.isFinite(up) ? up : null,
-          downPrice: Number.isFinite(down) ? down : null,
-          debug: {
-            timeRaw,
-            serverNowSec,
-            seconds,
-            windowStart,
-            slugsTried,
-          },
-        };
-      } catch (e) {
-        lastErr = e;
-      }
-    }
+    return intervalOk;
+  });
+
+  if (!candidates.length) {
+    return {
+      ok: false,
+      error: No matching Up/Down markets found via CLOB sampling-markets.,
+      debug: { scanned: all.length, asset: String(asset), interval },
+    };
+  }
+
+  const chosen = pickCurrentWindowMarket(candidates, nowSec);
+  const tokenInfo = extractUpDownTokens(chosen);
+
+  if (!chosen || !tokenInfo) {
+    return {
+      ok: false,
+      error: Found candidates but could not extract tokens.,
+      debug: { candidates: candidates.length },
+    };
+  }
+
+  // Confirm prices via /prices (sometimes token.price is fine, but this is safer)
+  let upPrice = Number.isFinite(tokenInfo.upPrice) ? tokenInfo.upPrice : null;
+  let downPrice = Number.isFinite(tokenInfo.downPrice) ? tokenInfo.downPrice : null;
+
+  try {
+    const prices = await getClobPrices([tokenInfo.upTokenId, tokenInfo.downTokenId]);
+    const up = Number(prices?.[tokenInfo.upTokenId]);
+    const down = Number(prices?.[tokenInfo.downTokenId]);
+    if (Number.isFinite(up)) upPrice = up;
+    if (Number.isFinite(down)) downPrice = down;
+  } catch {
+    // ignore; keep token snapshot prices
   }
 
   return {
-    ok: false,
-    error: lastErr?.message || "No active markets found in candidate windows",
-    debug: {
-      timeRaw,
-      serverNowSec,
-      seconds,
-      windowStart,
-      slugsTried,
-    },
+    ok: true,
+    title: chosen?.question || chosen?.description || "Up/Down",
+    marketSlug: chosen?.market_slug || null,
+    endDateIso: chosen?.end_date_iso || null,
+    upTokenId: tokenInfo.upTokenId,
+    downTokenId: tokenInfo.downTokenId,
+    upPrice,
+    downPrice,
   };
 }
 
@@ -206,31 +293,30 @@ export function formatUpDownLiveMessage(res, asset, intervalStr) {
 
   if (!res?.ok) {
     return [
-      `❌ Up/Down market not found yet.`,
-      `Asset: ${asset.toUpperCase()} | Interval: ${interval}`,
-      "",
-      `CLOB /time raw: ${res?.debug?.timeRaw ?? "?"}`,
-      `CLOB /time sec: ${res?.debug?.serverNowSec ?? "?"}`,
-      `Computed windowStart: ${res?.debug?.windowStart ?? "?"}`,
-      "",
-      `Tried slugs:`,
-      ...(res?.debug?.slugsTried || []).map((s) => `- ${s}`),
-      "",
-      `Last error: ${res?.error || "unknown"}`,
-    ].join("\n");
+      ❌ Up/Down not found (CLOB discovery).,
+      Asset: ${String(asset).toUpperCase()} | Interval: ${interval},
+      Reason: ${res?.error || "unknown"},
+      res?.debug?.scanned ? Scanned: ${res.debug.scanned} markets : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
   }
 
   const upPct = res.upPrice === null ? "?" : (res.upPrice * 100).toFixed(1) + "%";
   const downPct = res.downPrice === null ? "?" : (res.downPrice * 100).toFixed(1) + "%";
-  const url = `https://polymarket.com/event/${res.slug}`;
+
+  // We may not always have a slug that matches polymarket.com/event/<slug> for these,
+  // so we keep it clean and informational.
+  const ends = res.endDateIso ? Ends: ${res.endDateIso} : null;
 
   return [
-    `📈 Up/Down LIVE (${asset.toUpperCase()} ${interval})`,
+    📈 Up/Down LIVE (${String(asset).toUpperCase()} ${interval}),
     res.title,
+    ends,
     "",
-    `UP: ${upPct}`,
-    `DOWN: ${downPct}`,
-    "",
-    url,
-  ].join("\n");
+    UP: ${upPct},
+    DOWN: ${downPct},
+  ]
+    .filter(Boolean)
+    .join("\n");
 }

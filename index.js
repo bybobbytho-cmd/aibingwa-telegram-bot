@@ -34,7 +34,7 @@ const bot = new Bot(token);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function tgGet(path) {
-  const url = `https://api.telegram.org/bot${token}/${path}`;
+  const url = https://api.telegram.org/bot${token}/${path};
   const res = await fetch(url);
   const json = await res.json().catch(() => null);
   return { status: res.status, json };
@@ -58,7 +58,7 @@ async function logIdentity() {
       id: me.id,
       username: me.username,
       first_name: me.first_name,
-      instance: INSTANCE, // logs only
+      instance: INSTANCE,
     });
   } catch (e) {
     console.log("❌ getMe failed:", e?.message || e);
@@ -69,30 +69,31 @@ async function logIdentity() {
 function statusCompact() {
   return [
     "📊 Status",
-    `Simulation: ${SIM_ON ? "✅ ON" : "❌ OFF"}   Cash: $${SIM_START_CASH}`,
-    `AI: ${AI_ENABLED ? "✅ ON" : "❌ OFF"}   Model: ${AI_MODEL}`,
-    "Data: Up/Down LIVE via Gamma + CLOB (public reads)",
+    Simulation: ${SIM_ON ? "✅ ON" : "❌ OFF"}   Cash: $${SIM_START_CASH},
+    AI: ${AI_ENABLED ? "✅ ON" : "❌ OFF"}   Model: ${AI_MODEL},
+    "Data: Polymarket CLOB (public reads)",
   ].join("\n");
 }
 
 function statusDetails() {
   const keysLine = [
-    `Bankr: ${KEYS.bankr ? "✅" : "❌"}`,
-    `Anthropic: ${KEYS.anthropic ? "✅" : "❌"}`,
-    `OpenAI: ${KEYS.openai ? "✅" : "❌"}`,
-    `Gemini: ${KEYS.gemini ? "✅" : "❌"}`,
+    Telegram: ✅,
+    Bankr: ${KEYS.bankr ? "✅" : "❌"},
+    Anthropic: ${KEYS.anthropic ? "✅" : "❌"},
+    OpenAI: ${KEYS.openai ? "✅" : "❌"},
+    Gemini: ${KEYS.gemini ? "✅" : "❌"},
   ].join(" | ");
 
   return [
     "📊 Status (details)",
     "",
-    `Simulation: ${SIM_ON ? "✅ ON" : "❌ OFF"}`,
-    `Sim cash: $${SIM_START_CASH}`,
+    Simulation: ${SIM_ON ? "✅ ON" : "❌ OFF"},
+    Sim cash: $${SIM_START_CASH},
     "",
-    `AI: ${AI_ENABLED ? "✅ ON" : "❌ OFF"}`,
-    `AI model: ${AI_MODEL}`,
+    AI: ${AI_ENABLED ? "✅ ON" : "❌ OFF"},
+    AI model: ${AI_MODEL},
     "",
-    `Keys present: ${keysLine}`,
+    Keys present: ${keysLine},
     "",
     "Trading: OFF (data-only)",
   ].join("\n");
@@ -109,7 +110,7 @@ bot.command("start", async (ctx) => {
     [
       "Bot is live ✅",
       "",
-      "No-space commands:",
+      "No-space Up/Down commands:",
       "• /updownbtc5m  • /updownbtc15m  • /updownbtc60m",
       "• /updowneth5m  • /updowneth15m  • /updowneth60m",
       "",
@@ -141,7 +142,7 @@ bot.callbackQuery("status:less", async (ctx) => {
 bot.hears(/^\/updown(btc|eth)(5m|15m|60m)$/i, async (ctx) => {
   const [, asset, intervalStr] = ctx.match;
 
-  await ctx.reply(`🔎 Resolving LIVE ${asset.toUpperCase()} Up/Down ${intervalStr}…`);
+  await ctx.reply(🔎 Finding LIVE ${asset.toUpperCase()} Up/Down ${intervalStr} via CLOB…);
 
   try {
     const res = await resolveLiveUpDown(asset.toLowerCase(), intervalStr.toLowerCase());
@@ -152,7 +153,7 @@ bot.hears(/^\/updown(btc|eth)(5m|15m|60m)$/i, async (ctx) => {
   }
 });
 
-// Helpful “unknown command” fallback (optional)
+// Friendly hint if they type wrong format
 bot.on("message:text", async (ctx) => {
   const t = (ctx.message?.text || "").trim();
   if (t.startsWith("/updown") && !/^\/updown(btc|eth)(5m|15m|60m)$/i.test(t)) {

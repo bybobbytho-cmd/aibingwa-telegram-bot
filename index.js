@@ -11,12 +11,10 @@ import {
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) throw new Error("Missing TELEGRAM_BOT_TOKEN");
 
-// Flags (DATA FIRST)
 const AI_ENABLED = String(process.env.AI_ENABLED || "false").toLowerCase() === "true";
 const AI_MODEL = process.env.AI_MODEL || "unset";
-const MODE = String(process.env.MODE || "SIM").toUpperCase(); // SIM / REAL later
+const MODE = String(process.env.MODE || "SIM").toUpperCase();
 
-// Helps detect “multiple Railway instances”
 const INSTANCE =
   process.env.RAILWAY_REPLICA_ID ||
   process.env.RAILWAY_SERVICE_ID ||
@@ -35,6 +33,7 @@ function helpText() {
     `Instance: ${INSTANCE}`,
     "",
     "Commands:",
+    "• /ping",
     "• /status",
     "• /markets bitcoin",
     "• /markets eth",
@@ -45,7 +44,6 @@ function helpText() {
   ].join("\n");
 }
 
-// IMPORTANT: Clear webhook on Railway startup so long polling works (prevents 409 conflicts)
 async function ensurePollingMode() {
   const base = `https://api.telegram.org/bot${token}`;
 
@@ -73,11 +71,45 @@ async function ensurePollingMode() {
   }
 }
 
+// ---- DEBUG: log every message/update that reaches the bot ----
+bot.on("message", async (ctx) => {
+  const msg = ctx.message;
+  const from = msg?.from;
+  const chat = msg?.chat;
+
+  const text = msg?.text || "";
+  console.log("INCOMING MESSAGE ✅", {
+    instance: INSTANCE,
+    chat_id: chat?.id,
+    chat_type: chat?.type,
+    from_id: from?.id,
+    from_username: from?.username,
+    text,
+    date: msg?.date,
+  });
+});
+
+bot.on("callback_query:data", async (ctx) => {
+  console.log("INCOMING CALLBACK ✅", {
+    instance: INSTANCE,
+    from_id: ctx.from?.id,
+    data: ctx.callbackQuery?.data,
+  });
+});
+
+// ---- Commands ----
 bot.command("start", async (ctx) => {
+  console.log("COMMAND /start ✅");
   await ctx.reply(helpText());
 });
 
+bot.command("ping", async (ctx) => {
+  console.log("COMMAND /ping ✅");
+  await ctx.reply("pong ✅");
+});
+
 bot.command("status", async (ctx) => {
+  console.log("COMMAND /status ✅");
   await ctx.reply(
     [
       "📊 Status",
@@ -93,6 +125,7 @@ bot.command("status", async (ctx) => {
 });
 
 bot.command("markets", async (ctx) => {
+  console.log("COMMAND /markets ✅", { text: ctx.message?.text });
   const text = ctx.message?.text || "";
   const parts = text.trim().split(/\s+/);
   const queryRaw = parts.slice(1).join(" ").trim();
@@ -132,11 +165,12 @@ bot.command("markets", async (ctx) => {
 });
 
 bot.command("updown", async (ctx) => {
+  console.log("COMMAND /updown ✅", { text: ctx.message?.text });
   const text = ctx.message?.text || "";
   const parts = text.trim().split(/\s+/);
 
-  const asset = (parts[1] || "").toLowerCase(); // btc, eth
-  const horizon = (parts[2] || "").toLowerCase(); // 5m, 15m, 60m
+  const asset = (parts[1] || "").toLowerCase();
+  const horizon = (parts[2] || "").toLowerCase();
 
   if (!asset || !horizon) {
     await ctx.reply("Usage: /updown btc 5m  (also 15m, 60m)");

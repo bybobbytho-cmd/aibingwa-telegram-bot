@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { Bot } from "grammy";
+import { Bot, GrammyError } from "grammy";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) throw new Error("Missing TELEGRAM_BOT_TOKEN");
@@ -12,7 +12,8 @@ const INSTANCE =
 
 const bot = new Bot(token);
 
-// --- helper to call Telegram directly ---
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function tgGet(path) {
   const url = `https://api.telegram.org/bot${token}/${path}`;
   const res = await fetch(url);
@@ -20,37 +21,33 @@ async function tgGet(path) {
   return { status: res.status, json };
 }
 
-// --- CLEAR WEBHOOK ---
 async function clearWebhook() {
   const r = await tgGet("setWebhook?url=");
   console.log("clearWebhook =>", r);
 }
 
-// --- THIS IS THE IMPORTANT DIAGNOSTIC ---
-async function snapshotUpdates() {
-  const r = await tgGet("getUpdates?limit=5&timeout=0");
-  const summaries = (r.json?.result || []).map((u) => ({
-    update_id: u.update_id,
-    text: u.message?.text,
-    chat_id: u.message?.chat?.id,
-    from: u.message?.from?.username,
-  }));
-
-  console.log("Telegram getUpdates snapshot =>", {
-    instance: INSTANCE,
-    status: r.status,
-    ok: r.json?.ok,
-    count: summaries.length,
-    summaries,
-  });
+async function logIdentity() {
+  try {
+    const me = await bot.api.getMe();
+    console.log("✅ TOKEN BOT IDENTITY =>", {
+      id: me.id,
+      username: me.username,
+      first_name: me.first_name,
+      instance: INSTANCE,
+    });
+  } catch (e) {
+    console.log("❌ getMe failed:", e?.message || e);
+  }
 }
 
-// --- BASIC COMMAND ---
 bot.command("ping", async (ctx) => {
   await ctx.reply("pong ✅");
 });
 
-// --- LOG ANY MESSAGE THAT REACHES GRAMMY ---
+bot.command("start", async (ctx) => {
+  await ctx.reply("Bot is live ✅\nTry /ping");
+});
+
 bot.on("message", (ctx) => {
   console.log("INCOMING MESSAGE VIA GRAMMY =>", {
     instance: INSTANCE,
@@ -59,11 +56,31 @@ bot.on("message", (ctx) => {
   });
 });
 
-// --- STARTUP SEQUENCE ---
+bot.catch((err) => {
+  console.error("bot error:", err);
+});
+
+async function startPollingWithRetry() {
+  while (true) {
+    try {
+      console.log("STARTING POLLING =>", INSTANCE);
+      await bot.start(); // long-polling
+      console.log("bot.start exited (unexpected). Restarting in 5s…");
+      await sleep(5000);
+    } catch (e) {
+      // grammY wraps Telegram API errors as GrammyError
+      if (e instanceof GrammyError && e.error_code === 409) {
+        console.log("⚠️ 409 Conflict: another poller is active. Retrying in 35s…");
+        await sleep(35000); // wait for the other long poll to end
+        continue;
+      }
+      console.log("❌ Polling failed:", e?.message || e);
+      throw e;
+    }
+  }
+}
+
 console.log("BOOTING INSTANCE =>", INSTANCE);
-
 await clearWebhook();
-await snapshotUpdates();
-
-console.log("STARTING POLLING =>", INSTANCE);
-bot.start();
+await logIdentity();
+await startPollingWithRetry();

@@ -1,267 +1,286 @@
+const GAMMA_BASE = "https://gamma-api.polymarket.com";
 const CLOB_BASE = "https://clob.polymarket.com";
 
-const COMMON_HEADERS = {
-  accept: "application/json",
-  "user-agent":
-    "Mozilla/5.0 (compatible; aibingwa-telegram-bot/1.0; +https://github.com/bybobbytho-cmd/aibingwa-telegram-bot)",
-};
+// ---------
+// HTTP util
+// ---------
+async function fetchJson(url, { timeoutMs = 12000 } = {}) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
 
-function qs(params = {}) {
-  const u = new URLSearchParams();
-  for (const [k, v] of Object.entries(params)) {
-    if (v === undefined || v === null) continue;
-    u.set(k, String(v));
-  }
-  const s = u.toString();
-  return s ? `?${s}` : "";
-}
-
-async function fetchJson(url) {
-  const res = await fetch(url, { headers: COMMON_HEADERS });
-  const text = await res.text().catch(() => "");
-  if (!res.ok) {
-    const err = new Error(`HTTP ${res.status} ${url} :: ${text.slice(0, 250)}`);
-    err.status = res.status;
-    throw err;
-  }
   try {
-    return JSON.parse(text);
-  } catch {
-    const err = new Error(`Invalid JSON from ${url} :: ${text.slice(0, 250)}`);
-    err.status = 500;
-    throw err;
+    const res = await fetch(url, {
+      method: "GET",
+      headers: { "accept": "application/json" },
+      signal: controller.signal,
+    });
+
+    const text = await res.text();
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      // keep data null
+    }
+
+    if (!res.ok) {
+      const msg = `HTTP ${res.status} ${res.statusText} for ${url}`;
+      const err = new Error(msg);
+      err.status = res.status;
+      err.body = text;
+      throw err;
+    }
+
+    return data;
+  } finally {
+    clearTimeout(t);
   }
 }
 
-async function fetchText(url) {
-  const res = await fetch(url, {
-    headers: { ...COMMON_HEADERS, accept: "text/plain" },
-  });
-  const text = await res.text().catch(() => "");
-  if (!res.ok) {
-    const err = new Error(`HTTP ${res.status} ${url} :: ${text.slice(0, 250)}`);
-    err.status = res.status;
-    throw err;
+// ----------------------
+// Gamma: public-search
+// ----------------------
+// Docs: Gamma includes /public-search (search across events/markets/profiles). :contentReference[oaicite:2]{index=2}
+async function gammaPublicSearch(q, limitPerType = 25) {
+  const url =
+    `${GAMMA_BASE}/public-search?` +
+    new URLSearchParams({
+      q,
+      limit_per_type: String(limitPerType),
+      // keep_closed_markets=0 helps avoid resolved junk
+      keep_closed_markets: "0",
+      // events_status helps keep results current
+      events_status: "active",
+    }).toString();
+
+  return await fetchJson(url);
+}
+
+// ----------------------
+// Gamma: active events
+// ----------------------
+// Docs recommend /events?active=true&closed=false for active markets. :contentReference[oaicite:3]{index=3}
+export async function getTrendingMarkets(limit = 8) {
+  const url =
+    `${GAMMA_BASE}/events?` +
+    new URLSearchParams({
+      active: "true",
+      closed: "false",
+      limit: String(Math.max(limit, 20)),
+    }).toString();
+
+  const events = await fetchJson(url);
+  if (!Array.isArray(events)) return [];
+
+  // Flatten event->markets and pick a few “best looking”
+  const out = [];
+  for (const ev of events) {
+    const title = ev?.title || ev?.question || ev?.slug || "Untitled";
+    // Sometimes events contain markets array
+    const markets = Array.isArray(ev?.markets) ? ev.markets : [];
+    if (markets.length) {
+      // Use event title for output
+      out.push({ title });
+    } else {
+      out.push({ title });
+    }
+    if (out.length >= limit) break;
   }
-  return text.trim();
+  return out.slice(0, limit);
 }
 
-export async function getClobServerTimeSec() {
-  const raw = await fetchText(`${CLOB_BASE}/time`);
-  const n = Number(raw);
-  if (!Number.isFinite(n)) throw new Error(`Invalid /time response: "${raw}"`);
-  return n > 1e12 ? Math.floor(n / 1000) : Math.floor(n);
+// ----------------------
+// CLOB: midpoints
+// ----------------------
+// Midpoints are public and don’t need BUY/SELL side. :contentReference[oaicite:4]{index=4}
+async function clobMidpoints(tokenIds) {
+  const ids = tokenIds.filter(Boolean);
+  if (!ids.length) return {};
+
+  const url =
+    `${CLOB_BASE}/midpoints?` +
+    new URLSearchParams({ token_ids: ids.join(",") }).toString();
+
+  const data = await fetchJson(url);
+  // response is typically an object keyed by token_id
+  return data && typeof data === "object" ? data : {};
 }
 
-/**
- * CLOB sampling markets:
- * Docs say it returns { limit, next_cursor, count, data[] }. ([docs.polymarket.com](https://docs.polymarket.com/api-reference/markets/get-sampling-markets))
- */
-export async function getSamplingMarkets(next_cursor) {
-  const url = `${CLOB_BASE}/sampling-markets${qs({ next_cursor })}`;
-  return fetchJson(url);
-}
-
-export async function getClobPrices(tokenIds) {
-  const token_ids = tokenIds.join(",");
-  const url = `${CLOB_BASE}/prices${qs({ token_ids })}`;
-  return fetchJson(url);
-}
-
-function normalizeText(s) {
-  return String(s || "").toLowerCase();
-}
-
-function intervalMatchers(intervalStr) {
-  const i = String(intervalStr).toLowerCase();
-  if (i === "5m") return [/5\s*min/i, /5\s*minute/i, /\b5m\b/i, /-5m-/i];
-  if (i === "15m") return [/15\s*min/i, /15\s*minute/i, /\b15m\b/i, /-15m-/i];
-  if (i === "60m") return [/60\s*min/i, /60\s*minute/i, /1\s*hour/i, /\b60m\b/i, /-60m-/i];
+// ----------------------
+// Helpers: parsing Gamma
+// ----------------------
+function safeParseArray(maybeJson) {
+  if (Array.isArray(maybeJson)) return maybeJson;
+  if (typeof maybeJson === "string") {
+    try {
+      const v = JSON.parse(maybeJson);
+      return Array.isArray(v) ? v : [];
+    } catch {
+      return [];
+    }
+  }
   return [];
 }
 
-function assetMatchers(asset) {
-  const a = String(asset).toLowerCase();
-  if (a === "btc" || a === "bitcoin") return [/btc/i, /bitcoin/i];
-  if (a === "eth" || a === "ethereum") return [/eth/i, /ethereum/i];
-  return [new RegExp(a, "i")];
+function normalizeTitle(x) {
+  const s = String(x ?? "").trim();
+  return s.length ? s : "Untitled";
 }
 
-function looksLikeUpDown(m) {
-  const q = normalizeText(m?.question);
-  const d = normalizeText(m?.description);
-  const s = normalizeText(m?.market_slug);
-  return (
-    (q.includes("up") && q.includes("down")) ||
-    (d.includes("up") && d.includes("down")) ||
-    s.includes("updown") ||
-    q.includes("up/down") ||
-    d.includes("up/down")
-  );
+function looksActiveMarket(m) {
+  // Gamma fields vary; do best-effort.
+  if (!m || typeof m !== "object") return false;
+
+  // Common patterns
+  if (m.closed === true) return false;
+  if (m.active === false) return false;
+
+  // If enableOrderBook exists, prefer those markets for Up/Down since we need token ids
+  if (m.enableOrderBook === false) return false;
+
+  return true;
 }
 
-function marketIsTradeable(m) {
-  return (
-    m?.enable_order_book === true &&
-    m?.active === true &&
-    m?.accepting_orders === true &&
-    m?.closed !== true &&
-    m?.archived !== true
-  );
-}
+// ----------------------
+// Public: /markets query
+// ----------------------
+export async function searchMarkets(query, limit = 8) {
+  const resp = await gammaPublicSearch(query, 25);
 
-function parseIsoToSec(iso) {
-  const t = Date.parse(iso);
-  return Number.isFinite(t) ? Math.floor(t / 1000) : null;
-}
+  // Gamma public-search usually returns: { events: [...], markets: [...], profiles: [...] }
+  const markets = Array.isArray(resp?.markets) ? resp.markets : [];
+  const events = Array.isArray(resp?.events) ? resp.events : [];
 
-function pickCurrentWindowMarket(candidates, nowSec) {
-  let best = null;
-  let bestDelta = Infinity;
+  // Collect market-like objects
+  const collected = [];
 
-  for (const m of candidates) {
-    const endSec = parseIsoToSec(m?.end_date_iso);
-    if (!endSec) continue;
-    const delta = endSec - nowSec;
-    if (delta > 0 && delta < bestDelta) {
-      best = m;
-      bestDelta = delta;
+  // Prefer explicit markets array if present
+  for (const m of markets) {
+    const title = normalizeTitle(m?.question || m?.title || m?.slug);
+    const volume = m?.volume ?? m?.volume24hr ?? m?.liquidity ?? null;
+
+    // Sometimes Gamma market contains outcomePrices; take midpoint-ish
+    const prices = safeParseArray(m?.outcomePrices);
+    const priceMid = prices.length ? Number(prices[0]) : null;
+
+    collected.push({ title, volume, priceMid });
+  }
+
+  // Fallback: flatten event->markets
+  if (!collected.length) {
+    for (const ev of events) {
+      const evTitle = normalizeTitle(ev?.title || ev?.question || ev?.slug);
+      const ms = Array.isArray(ev?.markets) ? ev.markets : [];
+      for (const m of ms) {
+        const title = normalizeTitle(m?.question || m?.title || evTitle);
+        const volume = m?.volume ?? ev?.volume ?? null;
+        const prices = safeParseArray(m?.outcomePrices);
+        const priceMid = prices.length ? Number(prices[0]) : null;
+        collected.push({ title, volume, priceMid });
+      }
     }
   }
-  return best || candidates[0] || null;
+
+  // Keep only somewhat meaningful items
+  const cleaned = collected
+    .filter((x) => x.title && x.title !== "Untitled")
+    .slice(0, Math.max(limit, 8));
+
+  return cleaned.slice(0, limit);
 }
 
-function extractUpDownTokens(market) {
-  const tokens = Array.isArray(market?.tokens) ? market.tokens : [];
-  if (tokens.length < 2) return null;
+// -------------------------------------------
+// Up/Down discovery: Gamma search -> CLOB mid
+// -------------------------------------------
+//
+// Key point: Do NOT guess slugs. Use Gamma /public-search to discover the right market,
+// then read real-time prices from CLOB midpoints (public). :contentReference[oaicite:5]{index=5}
+export async function resolveUpDownMarketAndPrice({ asset, interval }) {
+  const assetName = asset === "btc" ? "bitcoin" : asset === "eth" ? "ethereum" : asset;
 
-  const up = tokens.find((t) => normalizeText(t?.outcome).includes("up"));
-  const down = tokens.find((t) => normalizeText(t?.outcome).includes("down"));
+  // Multiple queries because Polymarket naming changes often.
+  const intervalText =
+    interval === "5m" ? "5 minutes" : interval === "15m" ? "15 minutes" : "1 hour";
 
-  if (up && down) {
+  const queries = [
+    `${assetName} up or down ${intervalText}`,
+    `${assetName} up/down ${intervalText}`,
+    `${assetName} in ${intervalText}`,
+    `${assetName} price ${intervalText}`,
+    `${assetName} ${interval}`,
+  ];
+
+  // Run searches and collect candidate markets
+  const candidates = [];
+  const topTitles = [];
+
+  for (const q of queries) {
+    const resp = await gammaPublicSearch(q, 25);
+    const markets = Array.isArray(resp?.markets) ? resp.markets : [];
+
+    for (const m of markets) {
+      const title = normalizeTitle(m?.question || m?.title || m?.slug);
+      topTitles.push(title);
+
+      if (!looksActiveMarket(m)) continue;
+
+      // We NEED token IDs for CLOB pricing.
+      const tokenIds = safeParseArray(m?.clobTokenIds);
+      if (tokenIds.length < 2) continue;
+
+      candidates.push({
+        title,
+        raw: m,
+        tokenIds,
+      });
+    }
+
+    // If we got a solid set, break early
+    if (candidates.length >= 5) break;
+  }
+
+  // Pick the “best” candidate by simple scoring
+  const scored = candidates
+    .map((c) => {
+      const t = c.title.toLowerCase();
+      let score = 0;
+
+      if (t.includes(assetName)) score += 5;
+      if (t.includes("up") || t.includes("down") || t.includes("up/down")) score += 3;
+      if (t.includes("minute") || t.includes("hour") || t.includes(interval)) score += 2;
+
+      // prefer orderbook enabled markets if present
+      if (c.raw?.enableOrderBook === true) score += 1;
+
+      return { ...c, score };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  const best = scored[0];
+
+  if (!best) {
     return {
-      upTokenId: String(up.token_id),
-      downTokenId: String(down.token_id),
-      upPrice: Number(up.price),
-      downPrice: Number(down.price),
+      found: false,
+      debug: {
+        queries,
+        topTitles: Array.from(new Set(topTitles)).slice(0, 10),
+      },
     };
   }
 
-  return {
-    upTokenId: String(tokens[0].token_id),
-    downTokenId: String(tokens[1].token_id),
-    upPrice: Number(tokens[0].price),
-    downPrice: Number(tokens[1].price),
-  };
-}
+  // Get midpoint prices from CLOB
+  const [upTokenId, downTokenId] = best.tokenIds;
+  const mids = await clobMidpoints([upTokenId, downTokenId]);
 
-function isEndCursor(cursor) {
-  // Your logs show next_cursor="LTE=" which is base64 for "-1" (end).
-  return cursor === "LTE=" || cursor === "-1" || cursor === "" || cursor === null || cursor === undefined;
-}
-
-export async function resolveLiveUpDown(asset, intervalStr) {
-  const interval = String(intervalStr).toLowerCase();
-  const nowSec = await getClobServerTimeSec();
-
-  const assetRx = assetMatchers(asset);
-  const intervalRx = intervalMatchers(interval);
-
-  const MAX_PAGES = 8;
-  let cursor = undefined;
-  let all = [];
-
-  for (let i = 0; i < MAX_PAGES; i++) {
-    const page = await getSamplingMarkets(cursor);
-
-    const data = Array.isArray(page?.data) ? page.data : [];
-    all = all.concat(data);
-
-    const next = page?.next_cursor;
-
-    // ✅ FIX: stop when next_cursor indicates end (LTE= / -1)
-    if (isEndCursor(next)) break;
-
-    cursor = next;
-  }
-
-  const candidates = all.filter((m) => {
-    if (!marketIsTradeable(m)) return false;
-    if (!looksLikeUpDown(m)) return false;
-
-    const blob = `${m?.question || ""} ${m?.description || ""} ${m?.market_slug || ""}`;
-    const assetOk = assetRx.some((rx) => rx.test(blob));
-    if (!assetOk) return false;
-
-    const intervalOk = intervalRx.length ? intervalRx.some((rx) => rx.test(blob)) : true;
-    return intervalOk;
-  });
-
-  if (!candidates.length) {
-    return {
-      ok: false,
-      error: `No matching Up/Down markets found via CLOB sampling-markets.`,
-      debug: { scanned: all.length, asset: String(asset), interval },
-    };
-  }
-
-  const chosen = pickCurrentWindowMarket(candidates, nowSec);
-  const tokenInfo = extractUpDownTokens(chosen);
-
-  if (!chosen || !tokenInfo) {
-    return { ok: false, error: `Found candidates but could not extract tokens.` };
-  }
-
-  let upPrice = Number.isFinite(tokenInfo.upPrice) ? tokenInfo.upPrice : null;
-  let downPrice = Number.isFinite(tokenInfo.downPrice) ? tokenInfo.downPrice : null;
-
-  try {
-    const prices = await getClobPrices([tokenInfo.upTokenId, tokenInfo.downTokenId]);
-    const up = Number(prices?.[tokenInfo.upTokenId]);
-    const down = Number(prices?.[tokenInfo.downTokenId]);
-    if (Number.isFinite(up)) upPrice = up;
-    if (Number.isFinite(down)) downPrice = down;
-  } catch {
-    // keep token snapshot prices
-  }
+  const upMid = mids?.[upTokenId] != null ? Number(mids[upTokenId]) : null;
+  const downMid = mids?.[downTokenId] != null ? Number(mids[downTokenId]) : null;
 
   return {
-    ok: true,
-    title: chosen?.question || chosen?.description || "Up/Down",
-    endDateIso: chosen?.end_date_iso || null,
-    upTokenId: tokenInfo.upTokenId,
-    downTokenId: tokenInfo.downTokenId,
-    upPrice,
-    downPrice,
+    found: true,
+    title: best.title,
+    upTokenId,
+    downTokenId,
+    upMid,
+    downMid,
   };
-}
-
-export function formatUpDownLiveMessage(res, asset, intervalStr) {
-  const interval = String(intervalStr).toLowerCase();
-
-  if (!res?.ok) {
-    return [
-      `❌ Up/Down not found (CLOB discovery).`,
-      `Asset: ${String(asset).toUpperCase()} | Interval: ${interval}`,
-      `Reason: ${res?.error || "unknown"}`,
-      res?.debug?.scanned ? `Scanned: ${res.debug.scanned} markets` : "",
-    ]
-      .filter(Boolean)
-      .join("\n");
-  }
-
-  const upPct = res.upPrice === null ? "?" : (res.upPrice * 100).toFixed(1) + "%";
-  const downPct = res.downPrice === null ? "?" : (res.downPrice * 100).toFixed(1) + "%";
-  const ends = res.endDateIso ? `Ends: ${res.endDateIso}` : null;
-
-  return [
-    `📈 Up/Down LIVE (${String(asset).toUpperCase()} ${interval})`,
-    res.title,
-    ends,
-    "",
-    `UP: ${upPct}`,
-    `DOWN: ${downPct}`,
-  ]
-    .filter(Boolean)
-    .join("\n");
 }

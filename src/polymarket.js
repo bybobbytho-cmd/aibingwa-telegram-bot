@@ -75,6 +75,7 @@ function intervalSeconds(interval) {
 function candidateWindowStarts(sec) {
   const now = Math.floor(Date.now() / 1000);
   const cur = Math.floor(now / sec) * sec;
+  // try current, previous, next
   return [cur, cur - sec, cur + sec];
 }
 
@@ -94,11 +95,13 @@ function extractTokenIdsFromEvent(event) {
 
   const m = markets[0];
 
+  // Prefer tokens array if present
   if (Array.isArray(m?.tokens) && m.tokens.length >= 2) {
     const ids = m.tokens.map((t) => t?.token_id).filter(Boolean);
     if (ids.length >= 2) return ids.slice(0, 2);
   }
 
+  // Fallback: clobTokenIds
   const clobIds = safeParseArray(m?.clobTokenIds);
   if (clobIds.length >= 2) return clobIds.slice(0, 2);
 
@@ -161,4 +164,31 @@ export async function resolveUpDownMarketAndPrice({ asset, interval }) {
         : null,
     },
   };
+}
+
+// Basic live markets search using Gamma /markets (active=true)
+export async function searchMarketsBasic(query, limit = 8) {
+  const url =
+    `${GAMMA_BASE}/markets?` +
+    new URLSearchParams({
+      active: "true",
+      closed: "false",
+      limit: "200",
+      offset: "0",
+    }).toString();
+
+  const markets = await fetchJson(url);
+  if (!Array.isArray(markets)) return [];
+
+  const q = String(query || "").toLowerCase();
+
+  return markets
+    .map((m) => ({
+      title: m?.question || m?.title || m?.slug || "Untitled",
+      volume: m?.volumeNum ?? m?.volume ?? null,
+      liquidity: m?.liquidityNum ?? m?.liquidity ?? null,
+      slug: m?.slug,
+    }))
+    .filter((m) => String(m.title).toLowerCase().includes(q))
+    .slice(0, limit);
 }

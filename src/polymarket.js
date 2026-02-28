@@ -1,9 +1,20 @@
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
 const CLOB_BASE = "https://clob.polymarket.com";
 
-// ---------
-// HTTP util
-// ---------
+const INTERVAL_SECONDS = {
+  "5m": 300,
+  "15m": 900,
+};
+
+// Asset name variants (Polymarket can change naming)
+const ASSET_VARIANTS = {
+  btc: ["btc", "bitcoin"],
+  eth: ["eth", "ethereum"],
+  sol: ["sol", "solana"],
+  xrp: ["xrp", "ripple"],
+};
+
+// ---------- HTTP util ----------
 async function fetchJson(url, { timeoutMs = 12000 } = {}) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
@@ -11,7 +22,7 @@ async function fetchJson(url, { timeoutMs = 12000 } = {}) {
   try {
     const res = await fetch(url, {
       method: "GET",
-      headers: { "accept": "application/json" },
+      headers: { accept: "application/json" },
       signal: controller.signal,
     });
 
@@ -20,12 +31,11 @@ async function fetchJson(url, { timeoutMs = 12000 } = {}) {
     try {
       data = text ? JSON.parse(text) : null;
     } catch {
-      // keep data null
+      data = null;
     }
 
     if (!res.ok) {
-      const msg = `HTTP ${res.status} ${res.statusText} for ${url}`;
-      const err = new Error(msg);
+      const err = new Error(`HTTP ${res.status} ${url} :: ${text}`);
       err.status = res.status;
       err.body = text;
       throw err;
@@ -37,78 +47,6 @@ async function fetchJson(url, { timeoutMs = 12000 } = {}) {
   }
 }
 
-// ----------------------
-// Gamma: public-search
-// ----------------------
-// Docs: Gamma includes /public-search (search across events/markets/profiles). :contentReference[oaicite:2]{index=2}
-async function gammaPublicSearch(q, limitPerType = 25) {
-  const url =
-    `${GAMMA_BASE}/public-search?` +
-    new URLSearchParams({
-      q,
-      limit_per_type: String(limitPerType),
-      // keep_closed_markets=0 helps avoid resolved junk
-      keep_closed_markets: "0",
-      // events_status helps keep results current
-      events_status: "active",
-    }).toString();
-
-  return await fetchJson(url);
-}
-
-// ----------------------
-// Gamma: active events
-// ----------------------
-// Docs recommend /events?active=true&closed=false for active markets. :contentReference[oaicite:3]{index=3}
-export async function getTrendingMarkets(limit = 8) {
-  const url =
-    `${GAMMA_BASE}/events?` +
-    new URLSearchParams({
-      active: "true",
-      closed: "false",
-      limit: String(Math.max(limit, 20)),
-    }).toString();
-
-  const events = await fetchJson(url);
-  if (!Array.isArray(events)) return [];
-
-  // Flatten event->markets and pick a few “best looking”
-  const out = [];
-  for (const ev of events) {
-    const title = ev?.title || ev?.question || ev?.slug || "Untitled";
-    // Sometimes events contain markets array
-    const markets = Array.isArray(ev?.markets) ? ev.markets : [];
-    if (markets.length) {
-      // Use event title for output
-      out.push({ title });
-    } else {
-      out.push({ title });
-    }
-    if (out.length >= limit) break;
-  }
-  return out.slice(0, limit);
-}
-
-// ----------------------
-// CLOB: midpoints
-// ----------------------
-// Midpoints are public and don’t need BUY/SELL side. :contentReference[oaicite:4]{index=4}
-async function clobMidpoints(tokenIds) {
-  const ids = tokenIds.filter(Boolean);
-  if (!ids.length) return {};
-
-  const url =
-    `${CLOB_BASE}/midpoints?` +
-    new URLSearchParams({ token_ids: ids.join(",") }).toString();
-
-  const data = await fetchJson(url);
-  // response is typically an object keyed by token_id
-  return data && typeof data === "object" ? data : {};
-}
-
-// ----------------------
-// Helpers: parsing Gamma
-// ----------------------
 function safeParseArray(maybeJson) {
   if (Array.isArray(maybeJson)) return maybeJson;
   if (typeof maybeJson === "string") {
@@ -122,165 +60,122 @@ function safeParseArray(maybeJson) {
   return [];
 }
 
-function normalizeTitle(x) {
-  const s = String(x ?? "").trim();
-  return s.length ? s : "Untitled";
+// ---------- CLOB time ----------
+async function clobTimeSeconds() {
+  // Often returns { timestamp: <seconds> } or a raw number/string depending on version
+  const data = await fetchJson(`${CLOB_BASE}/time`);
+  if (typeof data === "number") return Math.floor(data);
+  if (typeof data === "string") return Math.floor(Number(data));
+  if (data && typeof data.timestamp === "number") return Math.floor(data.timestamp);
+  if (data && typeof data.time === "number") return Math.floor(data.time);
+  // fallback: system time
+  return Math.floor(Date.now() / 1000);
 }
 
-function looksActiveMarket(m) {
-  // Gamma fields vary; do best-effort.
-  if (!m || typeof m !== "object") return false;
+// ---------- CLOB midpoints ----------
+async function clobMidpoints(tokenIds) {
+  const ids = tokenIds.filter(Boolean);
+  if (!ids.length) return {};
 
-  // Common patterns
-  if (m.closed === true) return false;
-  if (m.active === false) return false;
+  const url =
+    `${CLOB_BASE}/midpoints?` +
+    new URLSearchParams({ token_ids: ids.join(",") }).toString();
 
-  // If enableOrderBook exists, prefer those markets for Up/Down since we need token ids
-  if (m.enableOrderBook === false) return false;
-
-  return true;
+  const data = await fetchJson(url);
+  return data && typeof data === "object" ? data : {};
 }
 
-// ----------------------
-// Public: /markets query
-// ----------------------
-export async function searchMarkets(query, limit = 8) {
-  const resp = await gammaPublicSearch(query, 25);
+// ---------- Gamma event-by-slug ----------
+async function gammaEventBySlug(slug) {
+  const url = `${GAMMA_BASE}/events/slug/${encodeURIComponent(slug)}`;
+  const data = await fetchJson(url);
 
-  // Gamma public-search usually returns: { events: [...], markets: [...], profiles: [...] }
-  const markets = Array.isArray(resp?.markets) ? resp.markets : [];
-  const events = Array.isArray(resp?.events) ? resp.events : [];
+  // Gamma sometimes returns an array, sometimes an object.
+  if (Array.isArray(data)) return data[0] ?? null;
+  if (data && typeof data === "object") return data;
+  return null;
+}
 
-  // Collect market-like objects
-  const collected = [];
+function pickTitle(ev) {
+  return (
+    ev?.title ||
+    ev?.question ||
+    ev?.slug ||
+    "Up/Down Market"
+  );
+}
 
-  // Prefer explicit markets array if present
-  for (const m of markets) {
-    const title = normalizeTitle(m?.question || m?.title || m?.slug);
-    const volume = m?.volume ?? m?.volume24hr ?? m?.liquidity ?? null;
-
-    // Sometimes Gamma market contains outcomePrices; take midpoint-ish
-    const prices = safeParseArray(m?.outcomePrices);
-    const priceMid = prices.length ? Number(prices[0]) : null;
-
-    collected.push({ title, volume, priceMid });
+// ---------- Main resolver ----------
+export async function resolveUpDownViaSlug({ asset, interval }) {
+  const seconds = INTERVAL_SECONDS[interval];
+  if (!seconds) {
+    return { found: false, triedSlugs: [], lastError: `Unsupported interval: ${interval}` };
   }
 
-  // Fallback: flatten event->markets
-  if (!collected.length) {
-    for (const ev of events) {
-      const evTitle = normalizeTitle(ev?.title || ev?.question || ev?.slug);
-      const ms = Array.isArray(ev?.markets) ? ev.markets : [];
-      for (const m of ms) {
-        const title = normalizeTitle(m?.question || m?.title || evTitle);
-        const volume = m?.volume ?? ev?.volume ?? null;
-        const prices = safeParseArray(m?.outcomePrices);
-        const priceMid = prices.length ? Number(prices[0]) : null;
-        collected.push({ title, volume, priceMid });
+  const variants = ASSET_VARIANTS[asset] || [asset];
+
+  // Use CLOB time (more reliable for Polymarket timing than local clock)
+  const now = await clobTimeSeconds();
+  const windowStart = Math.floor(now / seconds) * seconds;
+
+  // Try current, previous, next to handle indexing delays & boundaries
+  const candidateStarts = [windowStart, windowStart - seconds, windowStart + seconds];
+
+  const triedSlugs = [];
+  let lastError = "";
+
+  for (const ts of candidateStarts) {
+    for (const name of variants) {
+      const slug = `${name}-updown-${interval}-${ts}`;
+      triedSlugs.unshift(slug); // newest first
+
+      try {
+        const ev = await gammaEventBySlug(slug);
+        if (!ev) {
+          lastError = `Gamma returned empty for slug=${slug}`;
+          continue;
+        }
+
+        const markets = Array.isArray(ev.markets) ? ev.markets : [];
+        const m0 = markets[0];
+        const tokenIds = safeParseArray(m0?.clobTokenIds);
+
+        if (tokenIds.length < 2) {
+          lastError = `No clobTokenIds in event slug=${slug}`;
+          continue;
+        }
+
+        const [upTokenId, downTokenId] = tokenIds;
+
+        const mids = await clobMidpoints([upTokenId, downTokenId]);
+
+        const upMid = mids?.[upTokenId] != null ? Number(mids[upTokenId]) : null;
+        const downMid = mids?.[downTokenId] != null ? Number(mids[downTokenId]) : null;
+
+        return {
+          found: true,
+          title: pickTitle(ev),
+          slug,
+          windowStart: ts,
+          upTokenId,
+          downTokenId,
+          upMid,
+          downMid,
+          triedSlugs,
+          lastError: "",
+        };
+      } catch (e) {
+        // Common expected failures: 404 slug not found
+        lastError = String(e?.message || e);
+        continue;
       }
     }
   }
 
-  // Keep only somewhat meaningful items
-  const cleaned = collected
-    .filter((x) => x.title && x.title !== "Untitled")
-    .slice(0, Math.max(limit, 8));
-
-  return cleaned.slice(0, limit);
-}
-
-// -------------------------------------------
-// Up/Down discovery: Gamma search -> CLOB mid
-// -------------------------------------------
-//
-// Key point: Do NOT guess slugs. Use Gamma /public-search to discover the right market,
-// then read real-time prices from CLOB midpoints (public). :contentReference[oaicite:5]{index=5}
-export async function resolveUpDownMarketAndPrice({ asset, interval }) {
-  const assetName = asset === "btc" ? "bitcoin" : asset === "eth" ? "ethereum" : asset;
-
-  // Multiple queries because Polymarket naming changes often.
-  const intervalText =
-    interval === "5m" ? "5 minutes" : interval === "15m" ? "15 minutes" : "1 hour";
-
-  const queries = [
-    `${assetName} up or down ${intervalText}`,
-    `${assetName} up/down ${intervalText}`,
-    `${assetName} in ${intervalText}`,
-    `${assetName} price ${intervalText}`,
-    `${assetName} ${interval}`,
-  ];
-
-  // Run searches and collect candidate markets
-  const candidates = [];
-  const topTitles = [];
-
-  for (const q of queries) {
-    const resp = await gammaPublicSearch(q, 25);
-    const markets = Array.isArray(resp?.markets) ? resp.markets : [];
-
-    for (const m of markets) {
-      const title = normalizeTitle(m?.question || m?.title || m?.slug);
-      topTitles.push(title);
-
-      if (!looksActiveMarket(m)) continue;
-
-      // We NEED token IDs for CLOB pricing.
-      const tokenIds = safeParseArray(m?.clobTokenIds);
-      if (tokenIds.length < 2) continue;
-
-      candidates.push({
-        title,
-        raw: m,
-        tokenIds,
-      });
-    }
-
-    // If we got a solid set, break early
-    if (candidates.length >= 5) break;
-  }
-
-  // Pick the “best” candidate by simple scoring
-  const scored = candidates
-    .map((c) => {
-      const t = c.title.toLowerCase();
-      let score = 0;
-
-      if (t.includes(assetName)) score += 5;
-      if (t.includes("up") || t.includes("down") || t.includes("up/down")) score += 3;
-      if (t.includes("minute") || t.includes("hour") || t.includes(interval)) score += 2;
-
-      // prefer orderbook enabled markets if present
-      if (c.raw?.enableOrderBook === true) score += 1;
-
-      return { ...c, score };
-    })
-    .sort((a, b) => b.score - a.score);
-
-  const best = scored[0];
-
-  if (!best) {
-    return {
-      found: false,
-      debug: {
-        queries,
-        topTitles: Array.from(new Set(topTitles)).slice(0, 10),
-      },
-    };
-  }
-
-  // Get midpoint prices from CLOB
-  const [upTokenId, downTokenId] = best.tokenIds;
-  const mids = await clobMidpoints([upTokenId, downTokenId]);
-
-  const upMid = mids?.[upTokenId] != null ? Number(mids[upTokenId]) : null;
-  const downMid = mids?.[downTokenId] != null ? Number(mids[downTokenId]) : null;
-
   return {
-    found: true,
-    title: best.title,
-    upTokenId,
-    downTokenId,
-    upMid,
-    downMid,
+    found: false,
+    windowStart,
+    triedSlugs,
+    lastError: lastError || "Unknown failure",
   };
 }

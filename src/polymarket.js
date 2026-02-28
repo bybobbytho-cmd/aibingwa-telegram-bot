@@ -1,14 +1,15 @@
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
 const CLOB_BASE = "https://clob.polymarket.com";
 
-async function fetchJson(url, { timeoutMs = 12000 } = {}) {
+async function fetchJson(url, { timeoutMs = 12000, method = "GET", headers = {}, body = null } = {}) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const res = await fetch(url, {
-      method: "GET",
-      headers: { accept: "application/json" },
+      method,
+      headers: { accept: "application/json", ...headers },
+      body,
       signal: controller.signal,
     });
 
@@ -33,23 +34,12 @@ async function fetchJson(url, { timeoutMs = 12000 } = {}) {
   }
 }
 
-// Gamma: fetch event by slug (official pattern: /events?slug=...)
+// Gamma: event by slug (GET /events?slug=...)
 async function gammaEventBySlug(slug) {
   const url = `${GAMMA_BASE}/events?` + new URLSearchParams({ slug }).toString();
   const data = await fetchJson(url);
   if (Array.isArray(data) && data.length > 0) return data[0];
   return null;
-}
-
-// CLOB: midpoint prices (public)
-async function clobMidpoints(tokenIds) {
-  const ids = tokenIds.filter(Boolean);
-  if (!ids.length) return {};
-  const url =
-    `${CLOB_BASE}/midpoints?` +
-    new URLSearchParams({ token_ids: ids.join(",") }).toString();
-  const data = await fetchJson(url);
-  return data && typeof data === "object" ? data : {};
 }
 
 function safeParseArray(v) {
@@ -108,6 +98,65 @@ function extractTokenIdsFromEvent(event) {
   return [];
 }
 
+/**
+ * CLOB Midpoints — robust approach:
+ * 1) Try GET /midpoints?token_ids=... (docs say it works)
+ * 2) If 400, try POST /midpoints with JSON body (docs example)
+ * 3) If still failing, fall back to GET /midpoint per token
+ *
+ * Docs: GET /midpoints and POST /midpoints :contentReference[oaicite:2]{index=2}
+ * Docs: GET /midpoint :contentReference[oaicite:3]{index=3}
+ */
+async function clobMidpoints(tokenIds) {
+  const ids = tokenIds.filter(Boolean).map(String);
+  if (!ids.length) return {};
+
+  // Attempt 1: GET query params
+  try {
+    const url =
+      `${CLOB_BASE}/midpoints?` +
+      new URLSearchParams({ token_ids: ids.join(",") }).toString();
+    const data = await fetchJson(url);
+    if (data && typeof data === "object") return data;
+  } catch (e) {
+    // If it's not a 400, still try the other methods
+    // but keep the last error for debugging if everything fails.
+    if (e?.status !== 400) {
+      // continue
+    }
+  }
+
+  // Attempt 2: POST body (more reliable)
+  try {
+    const url = `${CLOB_BASE}/midpoints`;
+    const payload = ids.map((id) => ({ token_id: id }));
+    const data = await fetchJson(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (data && typeof data === "object") return data;
+  } catch (e) {
+    // continue to fallback
+  }
+
+  // Attempt 3: single midpoint calls
+  const out = {};
+  for (const id of ids) {
+    try {
+      const url =
+        `${CLOB_BASE}/midpoint?` + new URLSearchParams({ token_id: id }).toString();
+      const data = await fetchJson(url);
+      // docs: { "mid_price": "0.45" }
+      const mp = data?.mid_price ?? data?.midPrice ?? null;
+      if (mp != null) out[id] = String(mp);
+    } catch {
+      // ignore individual failures
+    }
+  }
+  return out;
+}
+
 export async function resolveUpDownMarketAndPrice({ asset, interval }) {
   const sec = intervalSeconds(interval);
   const starts = candidateWindowStarts(sec);
@@ -132,17 +181,22 @@ export async function resolveUpDownMarketAndPrice({ asset, interval }) {
         }
 
         const mids = await clobMidpoints(tokenIds);
-        const upMid = mids?.[tokenIds[0]] != null ? Number(mids[tokenIds[0]]) : null;
-        const downMid = mids?.[tokenIds[1]] != null ? Number(mids[tokenIds[1]]) : null;
+
+        // mids may map tokenId -> "0.45" (string) per docs
+        const upRaw = mids?.[tokenIds[0]] ?? null;
+        const downRaw = mids?.[tokenIds[1]] ?? null;
+
+        const upMid = upRaw != null ? Number(upRaw) : null;
+        const downMid = downRaw != null ? Number(downRaw) : null;
 
         return {
           found: true,
           title: event?.title || event?.question || slug,
           slug,
-          upTokenId: tokenIds[0],
-          downTokenId: tokenIds[1],
-          upMid,
-          downMid,
+          upTokenId: String(tokenIds[0]),
+          downTokenId: String(tokenIds[1]),
+          upMid: Number.isFinite(upMid) ? upMid : null,
+          downMid: Number.isFinite(downMid) ? downMid : null,
           debug: { tried },
         };
       } catch (e) {

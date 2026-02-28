@@ -1,253 +1,265 @@
+// src/polymarket.js
+// Working pipeline (restored + hardened):
+// CLOB /time (authoritative clock) -> build candidate slugs -> Gamma event-by-slug -> CLOB midpoints
+
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
 const CLOB_BASE = "https://clob.polymarket.com";
 
-// --------------------
-// HTTP utils
-// --------------------
-async function fetchText(url, { method = "GET", headers = {}, body, timeoutMs = 12000 } = {}) {
+import fs from "node:fs";
+import path from "node:path";
+
+// ---- tiny progress log (keeps a trail without breaking anything)
+const LOG_DIR = path.join(process.cwd(), "data");
+const LOG_FILE = path.join(LOG_DIR, "progress.jsonl");
+
+function logProgress(event, payload = {}) {
+  try {
+    if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+    fs.appendFileSync(
+      LOG_FILE,
+      JSON.stringify({ ts: new Date().toISOString(), event, ...payload }) + "\n"
+    );
+  } catch {
+    // never crash the bot because of logging
+  }
+}
+
+// -------------------
+// HTTP helper (safe)
+// -------------------
+async function fetchJson(url, { timeoutMs = 12000 } = {}) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const res = await fetch(url, {
-      method,
-      headers,
-      body,
+      method: "GET",
+      headers: { accept: "application/json" },
       signal: controller.signal,
     });
+
     const text = await res.text();
-    return { ok: res.ok, status: res.status, statusText: res.statusText, text };
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = null;
+    }
+
+    if (!res.ok) {
+      const err = new Error(`HTTP ${res.status} for ${url}`);
+      err.status = res.status;
+      err.body = text;
+      throw err;
+    }
+
+    return data;
   } finally {
     clearTimeout(t);
   }
 }
 
-async function fetchJson(url, opts = {}) {
-  const r = await fetchText(url, opts);
-  let data = null;
-  try {
-    data = r.text ? JSON.parse(r.text) : null;
-  } catch {
-    data = null;
-  }
-  if (!r.ok) {
-    const err = new Error(`HTTP ${r.status} ${r.statusText} for ${url}`);
-    err.status = r.status;
-    err.body = r.text;
-    throw err;
-  }
-  return data;
-}
-
-// --------------------
-// Gamma endpoints
-// --------------------
-
-// Get event by slug: /events/slug/{slug} :contentReference[oaicite:2]{index=2}
-async function gammaEventBySlug(slug) {
-  const url = `${GAMMA_BASE}/events/slug/${encodeURIComponent(slug)}`;
-  return await fetchJson(url, { timeoutMs: 12000 });
-}
-
-// Simple discovery for /markets (keep it basic + stable)
-export async function searchMarkets(query, limit = 8) {
-  const url =
-    `${GAMMA_BASE}/events?` +
-    new URLSearchParams({
-      search: query,
-      active: "true",
-      closed: "false",
-      limit: String(Math.max(limit, 10)),
-    }).toString();
-
-  const events = await fetchJson(url);
-  if (!Array.isArray(events)) return [];
-
-  const out = [];
-  for (const ev of events) {
-    const title = (ev?.title || ev?.question || ev?.slug || "Untitled").trim();
-    out.push({ title, volume: ev?.volume ?? null, priceMid: null });
-    if (out.length >= limit) break;
-  }
-  return out.slice(0, limit);
-}
-
-export async function getTrendingMarkets(limit = 8) {
-  const url =
-    `${GAMMA_BASE}/events?` +
-    new URLSearchParams({
-      active: "true",
-      closed: "false",
-      limit: String(Math.max(limit, 20)),
-    }).toString();
-
-  const events = await fetchJson(url);
-  if (!Array.isArray(events)) return [];
-
-  const out = [];
-  for (const ev of events) {
-    const title = (ev?.title || ev?.question || ev?.slug || "Untitled").trim();
-    out.push({ title });
-    if (out.length >= limit) break;
-  }
-  return out.slice(0, limit);
-}
-
-// --------------------
-// CLOB endpoints
-// --------------------
-
-// CLOB server time: GET /time :contentReference[oaicite:3]{index=3}
-async function clobServerTimeSec() {
+// -------------------
+// CLOB time (truth)
+// -------------------
+async function clobTimeSec() {
+  // Your logs already showed /time exists and works.
   const url = `${CLOB_BASE}/time`;
-  const r = await fetchText(url, { timeoutMs: 8000 });
-  if (!r.ok) throw new Error(`CLOB /time failed: HTTP ${r.status}`);
-  const n = Number(String(r.text).trim());
-  if (!Number.isFinite(n)) throw new Error(`CLOB /time returned non-number: ${r.text}`);
-  return n;
+  const data = await fetchJson(url);
+
+  // be flexible with formats
+  if (typeof data === "number") return Math.floor(data);
+  if (typeof data === "string" && /^\d+$/.test(data)) return Number(data);
+
+  if (data && typeof data === "object") {
+    const candidates = [
+      data.time,
+      data.server_time,
+      data.serverTime,
+      data.timestamp,
+      data.now,
+      data.current_time,
+      data.currentTime,
+    ].filter((x) => x != null);
+
+    for (const c of candidates) {
+      const n = Number(c);
+      if (Number.isFinite(n) && n > 1_500_000_000) return Math.floor(n);
+      // sometimes ms:
+      if (Number.isFinite(n) && n > 1_500_000_000_000) return Math.floor(n / 1000);
+    }
+  }
+
+  // fallback (should rarely happen)
+  return Math.floor(Date.now() / 1000);
 }
 
-// Midpoints: POST /midpoints (request body) :contentReference[oaicite:4]{index=4}
+// -------------------
+// CLOB midpoints
+// -------------------
 async function clobMidpoints(tokenIds) {
   const ids = tokenIds.filter(Boolean);
   if (!ids.length) return {};
 
-  const url = `${CLOB_BASE}/midpoints`;
-  const body = JSON.stringify({ token_ids: ids });
+  const url =
+    `${CLOB_BASE}/midpoints?` +
+    new URLSearchParams({ token_ids: ids.join(",") }).toString();
 
-  const data = await fetchJson(url, {
-    method: "POST",
-    headers: { "content-type": "application/json", accept: "application/json" },
-    body,
-    timeoutMs: 12000,
-  });
-
+  const data = await fetchJson(url);
   return data && typeof data === "object" ? data : {};
 }
 
-// --------------------
-// Up/Down slug resolver
-// --------------------
-const INTERVAL_SECONDS = {
-  "5m": 300,
-  "15m": 900,
-};
-
-const ASSET_ALIASES = {
-  btc: ["btc", "bitcoin"],
-  eth: ["eth", "ethereum"],
-  sol: ["sol", "solana"],
-  xrp: ["xrp", "ripple"],
-};
-
-function floorToWindowStart(sec, windowSizeSec) {
-  return Math.floor(sec / windowSizeSec) * windowSizeSec;
+// -------------------
+// Gamma event-by-slug
+// -------------------
+async function gammaEventBySlug(slug) {
+  // Docs show "Get event by slug"
+  // Common path is: /events/slug/{slug}
+  const url = `${GAMMA_BASE}/events/slug/${encodeURIComponent(slug)}`;
+  return await fetchJson(url);
 }
 
-function parseTokenIdsFromMarket(market) {
-  const raw = market?.clobTokenIds;
-  if (Array.isArray(raw)) return raw;
-
-  if (typeof raw === "string") {
+function safeParseArray(maybeJson) {
+  if (Array.isArray(maybeJson)) return maybeJson;
+  if (typeof maybeJson === "string") {
     try {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) return parsed;
+      const v = JSON.parse(maybeJson);
+      return Array.isArray(v) ? v : [];
     } catch {
-      // ignore
+      return [];
     }
   }
-
   return [];
 }
 
-function pickBestMarketFromEvent(ev) {
-  const markets = Array.isArray(ev?.markets) ? ev.markets : [];
-  if (!markets.length) return null;
-
-  // Up/Down should have 2 outcomes and clobTokenIds present
-  for (const m of markets) {
-    const ids = parseTokenIdsFromMarket(m);
-    if (ids.length >= 2) return m;
+function assetVariants(asset) {
+  // We try symbol + common full name variants (Polymarket slugs vary)
+  switch (asset) {
+    case "btc":
+      return ["btc", "bitcoin"];
+    case "eth":
+      return ["eth", "ethereum"];
+    case "sol":
+      return ["sol", "solana"];
+    case "xrp":
+      return ["xrp", "ripple"];
+    default:
+      return [asset];
   }
+}
+
+function intervalSeconds(interval) {
+  if (interval === "5m") return 300;
+  if (interval === "15m") return 900;
+  if (interval === "60m") return 3600;
   return null;
 }
 
-/**
- * Resolve Up/Down using deterministic slugs:
- * - use CLOB server time to sync
- * - try current, previous, next window
- * - try asset aliases (btc/bitcoin, eth/ethereum, etc)
- * - fetch Gamma event-by-slug (reliable when slug exists) :contentReference[oaicite:5]{index=5}
- * - then fetch CLOB midpoints for token IDs :contentReference[oaicite:6]{index=6}
- */
-export async function resolveUpDownBySlug({ asset, interval }) {
-  const windowSize = INTERVAL_SECONDS[interval];
-  if (!windowSize) {
+function windowStart(nowSec, seconds) {
+  return Math.floor(nowSec / seconds) * seconds;
+}
+
+// --------------------------------------
+// MAIN: Up/Down resolver (restored logic)
+// --------------------------------------
+export async function resolveUpDownMarketAndPrice({ asset, interval }) {
+  // You asked: keep what works, skip 60m for now.
+  if (interval === "60m") {
     return {
       found: false,
-      triedSlugs: [],
-      lastError: `Unsupported interval: ${interval} (supported: 5m, 15m)`,
+      reason: "60m disabled for now (we’ll revisit later). Try 5m or 15m.",
+      debug: { triedSlugs: [] },
     };
   }
 
-  const aliases = ASSET_ALIASES[asset] ?? [asset];
-  const nowSec = await clobServerTimeSec();
-  const windowStart = floorToWindowStart(nowSec, windowSize);
+  const seconds = intervalSeconds(interval);
+  if (!seconds) {
+    return {
+      found: false,
+      reason: "Unsupported interval",
+      debug: { triedSlugs: [] },
+    };
+  }
 
-  // Try: current, previous, next window (handles indexing delay + boundary)
-  const candidates = [windowStart, windowStart - windowSize, windowStart + windowSize];
+  const nowSec = await clobTimeSec();
+  const ws = windowStart(nowSec, seconds);
+
+  // Try: current window AND previous window (Gamma indexing delay is real)
+  const windowStarts = [ws, ws - seconds];
+
+  const variants = assetVariants(asset);
 
   const triedSlugs = [];
-  let lastError = null;
+  let lastErr = null;
 
-  for (const ts of candidates) {
-    for (const a of aliases) {
-      const slug = `${a}-updown-${interval}-${ts}`;
+  logProgress("updown_attempt", { asset, interval, nowSec, ws });
+
+  for (const w of windowStarts) {
+    for (const name of variants) {
+      const slug = `${name}-updown-${interval}-${w}`;
       triedSlugs.push(slug);
 
       try {
         const ev = await gammaEventBySlug(slug);
-        const market = pickBestMarketFromEvent(ev);
-        if (!market) {
-          lastError = `No markets/tokenIds inside Gamma event for slug=${slug}`;
-          continue;
-        }
 
-        const tokenIds = parseTokenIdsFromMarket(market);
-        if (tokenIds.length < 2) {
-          lastError = `Gamma market missing tokenIds for slug=${slug}`;
-          continue;
-        }
+        // Gamma event has markets, first market should have clobTokenIds
+        const markets = Array.isArray(ev?.markets) ? ev.markets : [];
+        if (!markets.length) continue;
+
+        const tokenIds = safeParseArray(markets[0]?.clobTokenIds);
+        if (tokenIds.length < 2) continue;
 
         const [upTokenId, downTokenId] = tokenIds;
-        const mids = await clobMidpoints([upTokenId, downTokenId]);
 
+        const mids = await clobMidpoints([upTokenId, downTokenId]);
         const upMid = mids?.[upTokenId] != null ? Number(mids[upTokenId]) : null;
         const downMid = mids?.[downTokenId] != null ? Number(mids[downTokenId]) : null;
 
-        const title = (ev?.title || ev?.question || slug).trim();
+        const title = ev?.title || ev?.question || `Up/Down ${asset.toUpperCase()} ${interval}`;
+
+        logProgress("updown_success", {
+          asset,
+          interval,
+          slug,
+          upMid,
+          downMid,
+        });
 
         return {
           found: true,
-          slug,
           title,
+          slug,
           upTokenId,
           downTokenId,
           upMid,
           downMid,
+          meta: { nowSec, windowStart: w },
         };
       } catch (e) {
-        // Common failure is 404 slug not found (market window not indexed yet)
-        const msg = e?.body ? String(e.body).slice(0, 180) : e?.message;
-        lastError = msg || "unknown error";
-        continue;
+        lastErr = e;
+        // keep trying candidates
       }
     }
   }
 
+  logProgress("updown_not_found", {
+    asset,
+    interval,
+    nowSec,
+    triedSlugsCount: triedSlugs.length,
+    lastErr: lastErr ? String(lastErr.message || lastErr) : null,
+  });
+
   return {
     found: false,
-    triedSlugs: triedSlugs.slice(0, 10), // keep output short
-    lastError,
+    reason: "Gamma slug not found (likely indexing delay or wrong window).",
+    debug: {
+      nowSec,
+      windowStart: ws,
+      triedSlugs,
+      lastError: lastErr
+        ? (lastErr.body ? `${lastErr.message} :: ${lastErr.body}` : lastErr.message)
+        : null,
+    },
   };
 }

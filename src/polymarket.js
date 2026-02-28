@@ -1,7 +1,6 @@
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
 const CLOB_BASE = "https://clob.polymarket.com";
 
-// --------- helpers ----------
 async function fetchJson(url, { timeoutMs = 12000 } = {}) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
@@ -24,7 +23,7 @@ async function fetchJson(url, { timeoutMs = 12000 } = {}) {
     } catch {}
 
     if (!res.ok) {
-      const err = new Error(`HTTP ${res.status} ${url} :: ${text.slice(0, 250)}`);
+      const err = new Error(`HTTP ${res.status} ${url} :: ${text.slice(0, 200)}`);
       err.status = res.status;
       err.body = text;
       throw err;
@@ -49,6 +48,34 @@ function safeParseArray(maybeJson) {
   return [];
 }
 
+function assetAliases(asset) {
+  const a = String(asset).toLowerCase();
+  if (a === "btc") return ["btc", "bitcoin"];
+  if (a === "eth") return ["eth", "ethereum"];
+  if (a === "sol") return ["sol", "solana"];
+  if (a === "xrp") return ["xrp", "ripple"];
+  return [a];
+}
+
+function normalize(s) {
+  return String(s || "").toLowerCase();
+}
+
+// Gamma discovery (public)
+async function gammaPublicSearch(q, limitPerType = 25) {
+  const url =
+    `${GAMMA_BASE}/public-search?` +
+    new URLSearchParams({
+      q,
+      limit_per_type: String(limitPerType),
+      keep_closed_markets: "0",
+      events_status: "active",
+    }).toString();
+
+  return fetchJson(url);
+}
+
+// CLOB live midpoints (public)
 async function clobMidpoints(tokenIds) {
   const ids = tokenIds.filter(Boolean);
   if (!ids.length) return {};
@@ -59,122 +86,125 @@ async function clobMidpoints(tokenIds) {
   return data && typeof data === "object" ? data : {};
 }
 
-// --------- deterministic slug (KNOWN-GOOD PATH) ----------
-function intervalSeconds(interval) {
-  if (interval === "5m") return 300;
-  if (interval === "15m") return 900;
-  throw new Error(`Unsupported interval: ${interval}`);
+function looksActiveMarket(m) {
+  if (!m || typeof m !== "object") return false;
+  if (m.closed === true) return false;
+  if (m.active === false) return false;
+  return true;
 }
 
-function windowStartNow(interval) {
-  const sec = intervalSeconds(interval);
-  const now = Math.floor(Date.now() / 1000);
-  return Math.floor(now / sec) * sec;
-}
+/**
+ * Stable resolver:
+ * - DOES NOT guess slugs
+ * - Uses Gamma public-search to discover the correct live Up/Down market
+ * - Then uses CLOB midpoints for prices
+ */
+export async function resolveUpDownViaGammaSearch({ asset, interval }) {
+  const aliases = assetAliases(asset);
+  const primary = aliases[aliases.length - 1];
 
-function assetSlugNames(asset) {
-  const a = String(asset).toLowerCase();
-  // Keep “short” tickers first because your working slug example uses btc-...
-  if (a === "btc") return ["btc", "bitcoin"];
-  if (a === "eth") return ["eth", "ethereum"];
-  if (a === "sol") return ["sol", "solana"];
-  if (a === "xrp") return ["xrp", "ripple"];
-  return [a];
-}
+  // Keep these queries simple and broad.
+  // We avoid strict interval-word filtering because it can eliminate valid markets.
+  const intervalPhrase = interval === "5m" ? "5 minutes" : "15 minutes";
 
-function buildUpDownSlug(assetName, interval, ts) {
-  // Observed working format from your screenshot:
-  // btc-updown-5m-1772296200
-  return `${assetName}-updown-${interval}-${ts}`;
-}
+  const queries = [
+    `${primary} up or down`,
+    `${primary} up/down`,
+    `${primary} up or down ${intervalPhrase}`,
+    `${primary} higher or lower`,
+    `${primary} price ${intervalPhrase}`,
+    `${primary} ${interval}`,
+  ];
 
-async function gammaGetEventBySlug(slug) {
-  // Official endpoint:
-  // GET https://gamma-api.polymarket.com/events/slug/{slug}
-  const url = `${GAMMA_BASE}/events/slug/${encodeURIComponent(slug)}`;
-  return fetchJson(url);
-}
+  const topTitles = [];
+  const candidates = [];
 
-// --------- main resolver ----------
-export async function resolveUpDownEventBySlug({ asset, interval }) {
-  const names = assetSlugNames(asset);
-  const base = windowStartNow(interval);
-  const sec = intervalSeconds(interval);
+  for (const q of queries) {
+    const resp = await gammaPublicSearch(q, 25);
+    const markets = Array.isArray(resp?.markets) ? resp.markets : [];
 
-  // Try current window, previous window, next window (handles indexing delays)
-  const timestamps = [base, base - sec, base + sec];
+    for (const m of markets) {
+      const title = m?.question || m?.title || m?.slug || "Untitled";
+      topTitles.push(title);
 
-  const triedSlugs = [];
-  let lastError = null;
+      if (!looksActiveMarket(m)) continue;
 
-  for (const ts of timestamps) {
-    for (const name of names) {
-      const slug = buildUpDownSlug(name, interval, ts);
-      triedSlugs.push(slug);
+      const tokenIds = safeParseArray(m?.clobTokenIds);
+      if (tokenIds.length < 2) continue;
 
-      try {
-        const event = await gammaGetEventBySlug(slug);
+      // Very light filtering: must look like Up/Down and include asset alias
+      const blob = normalize(`${title} ${m?.slug || ""}`);
+      const hasAsset = aliases.some((a) => blob.includes(normalize(a)));
+      const hasUpDown = blob.includes("up") || blob.includes("down") || blob.includes("up/down") || blob.includes("up or down");
+      if (!hasAsset || !hasUpDown) continue;
 
-        // event should have markets array
-        const markets = Array.isArray(event?.markets) ? event.markets : [];
-        if (!markets.length) {
-          lastError = `Gamma returned event but no markets for slug=${slug}`;
-          continue;
-        }
-
-        // Up/Down events typically have 1 market with 2 outcomes
-        const market = markets[0];
-        const tokenIds = safeParseArray(market?.clobTokenIds);
-
-        if (tokenIds.length < 2) {
-          lastError = `Missing clobTokenIds for slug=${slug}`;
-          continue;
-        }
-
-        const [upTokenId, downTokenId] = tokenIds;
-        const mids = await clobMidpoints([upTokenId, downTokenId]);
-
-        const upMid = mids?.[upTokenId] != null ? Number(mids[upTokenId]) : null;
-        const downMid = mids?.[downTokenId] != null ? Number(mids[downTokenId]) : null;
-
-        return {
-          found: true,
-          title: event?.title || event?.name || "Up/Down Market",
-          slug,
-          asset,
-          interval,
-          upTokenId,
-          downTokenId,
-          upMid,
-          downMid,
-          source: "Gamma event-by-slug + CLOB midpoints",
-        };
-      } catch (e) {
-        lastError = String(e?.message || e || "unknown error");
-        continue;
-      }
+      candidates.push({
+        title,
+        slug: m?.slug || null,
+        tokenIds,
+      });
     }
+
+    if (candidates.length >= 5) break;
   }
 
+  if (!candidates.length) {
+    return {
+      found: false,
+      reason: "No matching Up/Down markets discovered via Gamma search.",
+      debug: {
+        queries,
+        topTitles: Array.from(new Set(topTitles)).slice(0, 12),
+      },
+    };
+  }
+
+  // Pick the best candidate with a gentle preference for interval text
+  const want = interval === "5m" ? ["5m", "5 min", "5 minutes"] : ["15m", "15 min", "15 minutes"];
+  const scored = candidates
+    .map((c) => {
+      const b = normalize(`${c.title} ${c.slug || ""}`);
+      let s = 0;
+      for (const a of aliases) if (b.includes(normalize(a))) s += 5;
+      if (b.includes("up/down") || b.includes("up or down")) s += 3;
+      for (const w of want) if (b.includes(normalize(w))) s += 2;
+      return { ...c, score: s };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  const best = scored[0];
+
+  const [upTokenId, downTokenId] = best.tokenIds;
+  const mids = await clobMidpoints([upTokenId, downTokenId]);
+
+  const upMid = mids?.[upTokenId] != null ? Number(mids[upTokenId]) : null;
+  const downMid = mids?.[downTokenId] != null ? Number(mids[downTokenId]) : null;
+
   return {
-    found: false,
-    triedSlugs,
-    lastError,
+    found: true,
+    title: best.title,
+    slug: best.slug,
+    asset,
+    interval,
+    upTokenId,
+    downTokenId,
+    upMid,
+    downMid,
+    source: "Gamma search + CLOB midpoints",
   };
 }
 
-// --------- formatting ----------
 export function formatUpDownMessage(res) {
   const up = res.upMid != null && Number.isFinite(res.upMid) ? `${Math.round(res.upMid * 100)}¢` : "—";
   const down = res.downMid != null && Number.isFinite(res.downMid) ? `${Math.round(res.downMid * 100)}¢` : "—";
 
   return [
     `📈 *${res.title}*`,
-    `Slug: \`${res.slug}\``,
+    res.slug ? `Slug: \`${res.slug}\`` : null,
     "",
     `UP (mid): *${up}*`,
     `DOWN (mid): *${down}*`,
     "",
     `_Source: ${res.source}_`,
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }

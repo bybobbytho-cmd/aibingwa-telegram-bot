@@ -1,6 +1,6 @@
 import "dotenv/config";
 import { Bot, InlineKeyboard, GrammyError, HttpError } from "grammy";
-import { resolveUpDownEventBySlug, formatUpDownMessage } from "./src/polymarket.js";
+import { resolveUpDownViaGammaSearch, formatUpDownMessage } from "./src/polymarket.js";
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 if (!TOKEN) {
@@ -11,7 +11,7 @@ if (!TOKEN) {
 const bot = new Bot(TOKEN);
 
 // ----------
-// Flags/env (read-only display)
+// Flags/env
 // ----------
 const SIMULATION_ON = String(process.env.SIMULATION ?? "true").toLowerCase() === "true";
 const SIM_CASH = Number(process.env.SIM_CASH ?? process.env.SIM_START_CASH ?? "50");
@@ -36,19 +36,17 @@ function yn(v) {
 }
 
 // ----------
-// Status UI (compact + dropdown)
+// Status UI
 // ----------
 function statusCompact() {
   return [
     "📊 *Status*",
     `Simulation: ${SIMULATION_ON ? "✅ ON" : "❌ OFF"}`,
     `Sim cash: $${Number.isFinite(SIM_CASH) ? SIM_CASH : 0}`,
-    "",
     `AI: ${AI_ENABLED ? "✅ ON" : "❌ OFF"}`,
     `AI model: \`${AI_MODEL}\``,
     "",
-    "_Data: Polymarket (public)_",
-    "_Trading: OFF (data only)_",
+    "_Data: Polymarket (public reads)_",
   ].join("\n");
 }
 
@@ -70,11 +68,10 @@ function statusDetails() {
     `AI: ${AI_ENABLED ? "✅ ON" : "❌ OFF"}`,
     `AI model: \`${AI_MODEL}\``,
     "",
-    "*Keys present in Railway env* (presence only)",
+    "*Keys present in Railway env* (presence only)*",
     keysLine,
     "",
-    "_Data: Polymarket Gamma + CLOB (public)_",
-    "_Trading: OFF (data only)_",
+    "Trading: *OFF* (data-only)",
   ].join("\n");
 }
 
@@ -89,76 +86,66 @@ bot.command("start", async (ctx) => {
     [
       "Bot is live ✅",
       "",
-      "Up/Down commands (NO SPACES):",
-      "• /updownbtc5m   • /updownbtc15m",
-      "• /updowneth5m   • /updowneth15m",
-      "• /updownsol5m   • /updownsol15m",
-      "• /updownxrp5m   • /updownxrp15m",
+      "Up/Down (no spaces):",
+      "• /updownbtc5m  • /updownbtc15m",
+      "• /updowneth5m  • /updowneth15m",
+      "• /updownsol5m  • /updownsol15m",
+      "• /updownxrp5m  • /updownxrp15m",
       "",
       "Other:",
       "• /ping",
       "• /status",
       "",
-      "Note: 60m/hourly is disabled for now (we’ll add later).",
+      "Note: 60m/hourly is disabled for now (we’ll add it later).",
     ].join("\n")
   );
 });
 
-bot.command("ping", async (ctx) => {
-  await ctx.reply("pong ✅");
-});
+bot.command("ping", async (ctx) => ctx.reply("pong ✅"));
 
 bot.command("status", async (ctx) => {
-  await ctx.reply(statusCompact(), {
-    parse_mode: "Markdown",
-    reply_markup: statusKb(false),
-  });
+  await ctx.reply(statusCompact(), { parse_mode: "Markdown", reply_markup: statusKb(false) });
 });
-
 bot.callbackQuery("status:more", async (ctx) => {
   await ctx.answerCallbackQuery();
-  await ctx.editMessageText(statusDetails(), {
-    parse_mode: "Markdown",
-    reply_markup: statusKb(true),
-  });
+  await ctx.editMessageText(statusDetails(), { parse_mode: "Markdown", reply_markup: statusKb(true) });
 });
-
 bot.callbackQuery("status:less", async (ctx) => {
   await ctx.answerCallbackQuery();
-  await ctx.editMessageText(statusCompact(), {
-    parse_mode: "Markdown",
-    reply_markup: statusKb(false),
-  });
+  await ctx.editMessageText(statusCompact(), { parse_mode: "Markdown", reply_markup: statusKb(false) });
 });
 
 // ----------
-// Up/Down — LAST KNOWN-GOOD BEHAVIOR
-// Gamma event-by-slug + CLOB midpoints
-// ONLY 5m / 15m for now
+// Up/Down (no-space) — 5m/15m only
 // ----------
 bot.hears(/^\/updown(btc|eth|sol|xrp)(5m|15m)$/i, async (ctx) => {
   const [, assetRaw, intervalRaw] = ctx.match;
   const asset = String(assetRaw).toLowerCase();
   const interval = String(intervalRaw).toLowerCase();
 
-  await ctx.reply(`🔎 Resolving LIVE ${asset.toUpperCase()} Up/Down ${interval}...`);
+  await ctx.reply(`🔎 Finding LIVE ${asset.toUpperCase()} Up/Down ${interval}...`);
 
   try {
-    const res = await resolveUpDownEventBySlug({ asset, interval });
+    const res = await resolveUpDownViaGammaSearch({ asset, interval });
 
     if (!res.found) {
-      await ctx.reply(
-        [
-          `❌ Up/Down market not found yet.`,
-          `Asset: ${asset.toUpperCase()} | Interval: ${interval}`,
-          `Tried slugs: ${res.triedSlugs.join(", ")}`,
-          res.lastError ? `Last error: ${res.lastError}` : null,
-          "",
-          "Tip: if you run this exactly on the boundary, try again in ~10 seconds.",
-        ]
-          .filter(Boolean)
-          .join("\n")
-      );
+      const lines = [
+        `❌ Up/Down not found.`,
+        `Asset: ${asset.toUpperCase()} | Interval: ${interval}`,
+        `Reason: ${res.reason || "No match discovered via Gamma search."}`,
+      ];
+
+      if (res.debug?.queries?.length) {
+        lines.push("", "Tried queries:");
+        for (const q of res.debug.queries) lines.push(`- ${q}`);
+      }
+
+      if (res.debug?.topTitles?.length) {
+        lines.push("", "Top matches returned (for tuning):");
+        for (const t of res.debug.topTitles.slice(0, 8)) lines.push(`- ${t}`);
+      }
+
+      await ctx.reply(lines.join("\n"));
       return;
     }
 
@@ -166,27 +153,20 @@ bot.hears(/^\/updown(btc|eth|sol|xrp)(5m|15m)$/i, async (ctx) => {
   } catch (e) {
     console.error("updown error:", e);
     const msg = String(e?.message || e || "unknown error");
-    await ctx.reply(["⚠️ Up/Down failed. Check Railway logs.", `Error: ${msg}`].join("\n"));
+    await ctx.reply(["⚠️ Up/Down failed.", `Error: ${msg.slice(0, 220)}`].join("\n"));
   }
 });
 
-// Hint if user types spaces like "/updown btc 5m"
 bot.on("message:text", async (ctx) => {
   const t = (ctx.message?.text || "").trim();
   if (/^\/updown\s+/i.test(t)) {
-    await ctx.reply(
-      "Use no-space commands like:\n/updownbtc5m\n/updownbtc15m\n/updowneth5m\n/updownsol15m"
-    );
+    await ctx.reply("Use no-space commands like /updownbtc5m or /updowneth15m");
   }
 });
 
-// ----------
-// Error handler
-// ----------
 bot.catch((err) => {
   const e = err.error;
   console.error("bot.catch =>", err);
-
   if (e instanceof GrammyError) console.error("GrammyError =>", e.description);
   else if (e instanceof HttpError) console.error("HttpError =>", e.error);
   else console.error("Unknown error =>", e);

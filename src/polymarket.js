@@ -1,24 +1,9 @@
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
 const CLOB_BASE = "https://clob.polymarket.com";
 
-const INTERVAL_SECONDS = {
-  "5m": 300,
-  "15m": 900,
-};
-
-// Asset name variants (Polymarket can change naming)
-const ASSET_VARIANTS = {
-  btc: ["btc", "bitcoin"],
-  eth: ["eth", "ethereum"],
-  sol: ["sol", "solana"],
-  xrp: ["xrp", "ripple"],
-};
-
-// ---------- HTTP util ----------
 async function fetchJson(url, { timeoutMs = 12000 } = {}) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
-
   try {
     const res = await fetch(url, {
       method: "GET",
@@ -35,23 +20,29 @@ async function fetchJson(url, { timeoutMs = 12000 } = {}) {
     }
 
     if (!res.ok) {
-      const err = new Error(`HTTP ${res.status} ${url} :: ${text}`);
+      const err = new Error(`HTTP ${res.status} for ${url}`);
       err.status = res.status;
       err.body = text;
       throw err;
     }
-
     return data;
   } finally {
     clearTimeout(t);
   }
 }
 
-function safeParseArray(maybeJson) {
-  if (Array.isArray(maybeJson)) return maybeJson;
-  if (typeof maybeJson === "string") {
+// Gamma "event-by-slug" endpoint (this is what worked when you saw: Source: Gamma event-by-slug + CLOB midpoints)
+async function gammaEventBySlug(slug) {
+  // add cache-buster to reduce edge caching weirdness
+  const url = `${GAMMA_BASE}/events/slug/${encodeURIComponent(slug)}?cache=false&_=${Date.now()}`;
+  return await fetchJson(url);
+}
+
+function safeParseArray(x) {
+  if (Array.isArray(x)) return x;
+  if (typeof x === "string") {
     try {
-      const v = JSON.parse(maybeJson);
+      const v = JSON.parse(x);
       return Array.isArray(v) ? v : [];
     } catch {
       return [];
@@ -60,19 +51,6 @@ function safeParseArray(maybeJson) {
   return [];
 }
 
-// ---------- CLOB time ----------
-async function clobTimeSeconds() {
-  // Often returns { timestamp: <seconds> } or a raw number/string depending on version
-  const data = await fetchJson(`${CLOB_BASE}/time`);
-  if (typeof data === "number") return Math.floor(data);
-  if (typeof data === "string") return Math.floor(Number(data));
-  if (data && typeof data.timestamp === "number") return Math.floor(data.timestamp);
-  if (data && typeof data.time === "number") return Math.floor(data.time);
-  // fallback: system time
-  return Math.floor(Date.now() / 1000);
-}
-
-// ---------- CLOB midpoints ----------
 async function clobMidpoints(tokenIds) {
   const ids = tokenIds.filter(Boolean);
   if (!ids.length) return {};
@@ -85,97 +63,98 @@ async function clobMidpoints(tokenIds) {
   return data && typeof data === "object" ? data : {};
 }
 
-// ---------- Gamma event-by-slug ----------
-async function gammaEventBySlug(slug) {
-  const url = `${GAMMA_BASE}/events/slug/${encodeURIComponent(slug)}`;
-  const data = await fetchJson(url);
+// Build candidate slugs around the current window (current, previous, next)
+// This is to survive indexing delays + boundary timing.
+function candidateSlugs({ asset, interval }) {
+  const secondsMap = { "5m": 300, "15m": 900 };
+  const seconds = secondsMap[interval];
+  if (!seconds) return [];
 
-  // Gamma sometimes returns an array, sometimes an object.
-  if (Array.isArray(data)) return data[0] ?? null;
-  if (data && typeof data === "object") return data;
-  return null;
-}
-
-function pickTitle(ev) {
-  return (
-    ev?.title ||
-    ev?.question ||
-    ev?.slug ||
-    "Up/Down Market"
-  );
-}
-
-// ---------- Main resolver ----------
-export async function resolveUpDownViaSlug({ asset, interval }) {
-  const seconds = INTERVAL_SECONDS[interval];
-  if (!seconds) {
-    return { found: false, triedSlugs: [], lastError: `Unsupported interval: ${interval}` };
-  }
-
-  const variants = ASSET_VARIANTS[asset] || [asset];
-
-  // Use CLOB time (more reliable for Polymarket timing than local clock)
-  const now = await clobTimeSeconds();
+  const now = Math.floor(Date.now() / 1000);
   const windowStart = Math.floor(now / seconds) * seconds;
 
-  // Try current, previous, next to handle indexing delays & boundaries
-  const candidateStarts = [windowStart, windowStart - seconds, windowStart + seconds];
+  const tsCandidates = [
+    windowStart,
+    windowStart - seconds,
+    windowStart + seconds,
+    windowStart - 2 * seconds,
+  ];
 
+  // asset name variants (what Polymarket sometimes uses in slugs)
+  const names = [];
+  if (asset === "btc") names.push("btc", "bitcoin");
+  else if (asset === "eth") names.push("eth", "ethereum");
+  else if (asset === "sol") names.push("sol", "solana");
+  else if (asset === "xrp") names.push("xrp");
+
+  const slugs = [];
+  for (const name of names) {
+    for (const ts of tsCandidates) {
+      slugs.push(`${name}-updown-${interval}-${ts}`);
+    }
+  }
+  return slugs;
+}
+
+export async function resolveUpDown({ asset, interval }) {
   const triedSlugs = [];
-  let lastError = "";
+  let lastError = null;
 
-  for (const ts of candidateStarts) {
-    for (const name of variants) {
-      const slug = `${name}-updown-${interval}-${ts}`;
-      triedSlugs.unshift(slug); // newest first
+  const slugs = candidateSlugs({ asset, interval });
 
-      try {
-        const ev = await gammaEventBySlug(slug);
-        if (!ev) {
-          lastError = `Gamma returned empty for slug=${slug}`;
-          continue;
-        }
+  for (const slug of slugs) {
+    triedSlugs.push(slug);
+    try {
+      const ev = await gammaEventBySlug(slug);
 
-        const markets = Array.isArray(ev.markets) ? ev.markets : [];
-        const m0 = markets[0];
-        const tokenIds = safeParseArray(m0?.clobTokenIds);
-
-        if (tokenIds.length < 2) {
-          lastError = `No clobTokenIds in event slug=${slug}`;
-          continue;
-        }
-
-        const [upTokenId, downTokenId] = tokenIds;
-
-        const mids = await clobMidpoints([upTokenId, downTokenId]);
-
-        const upMid = mids?.[upTokenId] != null ? Number(mids[upTokenId]) : null;
-        const downMid = mids?.[downTokenId] != null ? Number(mids[downTokenId]) : null;
-
-        return {
-          found: true,
-          title: pickTitle(ev),
-          slug,
-          windowStart: ts,
-          upTokenId,
-          downTokenId,
-          upMid,
-          downMid,
-          triedSlugs,
-          lastError: "",
-        };
-      } catch (e) {
-        // Common expected failures: 404 slug not found
-        lastError = String(e?.message || e);
+      // ev should contain markets; take first market
+      const markets = Array.isArray(ev?.markets) ? ev.markets : [];
+      if (!markets.length) {
+        lastError = "Gamma returned event without markets";
         continue;
       }
+
+      const m = markets[0];
+      const tokenIds = safeParseArray(m?.clobTokenIds);
+      if (tokenIds.length < 2) {
+        lastError = "Missing clobTokenIds in Gamma response";
+        continue;
+      }
+
+      const [upTokenId, downTokenId] = tokenIds;
+
+      const mids = await clobMidpoints([upTokenId, downTokenId]);
+      const upMid = mids?.[upTokenId] != null ? Number(mids[upTokenId]) : null;
+      const downMid = mids?.[downTokenId] != null ? Number(mids[downTokenId]) : null;
+
+      const title = ev?.title || ev?.question || "Up/Down Market";
+
+      return {
+        found: true,
+        title,
+        slug,
+        upTokenId,
+        downTokenId,
+        upMid,
+        downMid,
+        triedSlugs,
+        lastError: null,
+      };
+    } catch (e) {
+      const status = e?.status;
+      // 404 is normal when slug isn't indexed yet
+      if (status === 404) {
+        lastError = `404 slug not found`;
+        continue;
+      }
+      lastError = String(e?.message || e);
+      continue;
     }
   }
 
   return {
     found: false,
-    windowStart,
-    triedSlugs,
-    lastError: lastError || "Unknown failure",
+    triedSlugs: triedSlugs.slice(0, 12),
+    lastError,
   };
 }

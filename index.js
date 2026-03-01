@@ -6,8 +6,12 @@ import {
 } from "./src/polymarket.js";
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+
 if (!TOKEN) {
   console.error("❌ Missing TELEGRAM_BOT_TOKEN env var");
+  // If you truly see this in Railway logs, bot should NOT be working.
+  // If Telegram still responds, it means Railway is running a different deploy/build
+  // or the env var name differs in that running version.
   process.exit(1);
 }
 
@@ -59,8 +63,12 @@ function detailedStatusText() {
     `Telegram: ${yn(hasTelegramToken)}  Bankr: ${yn(hasBankrKey)}`,
     `Anthropic: ${yn(hasAnthropicKey)}  OpenAI: ${yn(hasOpenAIKey)}  Gemini: ${yn(hasGeminiKey)}`,
     "",
-    "_Data:_ Gamma (discovery) + CLOB (prices), public endpoints only.",
+    "_Data:_ Gamma + CLOB, public only.",
   ].join("\n");
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 // --------------------
@@ -77,9 +85,9 @@ bot.command("start", async (ctx) => {
       "",
       "Try:",
       "• /status",
-      "• /marketsbtc",
-      "• /marketscrypto",
       "• /updownbtc5m",
+      "• /updownbtc15m",
+      "• /updowneth5m",
       "• /updowneth15m",
     ].join("\n")
   );
@@ -103,15 +111,15 @@ bot.callbackQuery("status:compact", async (ctx) => {
   await ctx.answerCallbackQuery();
 });
 
-// /markets <query> (space version)
+// Optional: /markets (keep, but not required)
 bot.command("markets", async (ctx) => {
   const arg = (ctx.match ?? "").trim();
   if (!arg) {
-    await ctx.reply("Usage: /markets bitcoin  (or try /marketsbtc /marketscrypto /marketstrending)");
+    await ctx.reply("Usage: /markets bitcoin");
     return;
   }
 
-  await ctx.reply("🔎 Searching LIVE markets (Gamma public-search)...");
+  await ctx.reply("🔎 Searching LIVE markets...");
   try {
     const results = await searchMarkets(arg, 8);
     if (!results.length) {
@@ -130,81 +138,28 @@ bot.command("markets", async (ctx) => {
     await ctx.reply(msg);
   } catch (e) {
     console.error("markets error:", e);
-    await ctx.reply("⚠️ markets failed. Check Railway logs for the error.");
+    await ctx.reply("⚠️ markets failed. Check Railway logs.");
   }
 });
 
-// No-space markets shortcuts: /marketsbtc, /marketseth, /marketscrypto, /marketstrending
-bot.hears(/^\/markets([a-z0-9_-]+)$/i, async (ctx) => {
-  const query = String(ctx.match?.[1] ?? "").trim().toLowerCase();
-  if (!query) return;
-
-  if (query === "trending") {
-    await ctx.reply("🔥 Fetching trending ACTIVE markets (Gamma events active=true)...");
-    try {
-      const results = await getTrendingMarkets(8);
-      const msg = results
-        .map((m, i) => `${i + 1}) ${m.title}`)
-        .join("\n");
-      await ctx.reply(msg || "No trending markets returned.");
-    } catch (e) {
-      console.error("trending error:", e);
-      await ctx.reply("⚠️ trending failed. Check Railway logs.");
-    }
-    return;
-  }
-
-  await ctx.reply("🔎 Searching LIVE markets (Gamma public-search)...");
-  try {
-    const results = await searchMarkets(query, 8);
-    if (!results.length) {
-      await ctx.reply(`No markets found for: ${query}`);
-      return;
-    }
-
-    const msg = results
-      .map((m, i) => {
-        const p = m.priceMid != null ? `${Math.round(m.priceMid * 100)}¢` : "—";
-        const vol = m.volume != null ? `$${Math.round(m.volume).toLocaleString()}` : "—";
-        return `${i + 1}) ${m.title}\n   Price: ${p}  Vol: ${vol}`;
-      })
-      .join("\n\n");
-
-    await ctx.reply(msg);
-  } catch (e) {
-    console.error("markets shortcut error:", e);
-    await ctx.reply("⚠️ markets failed. Check Railway logs for the error.");
-  }
-});
-
-// Up/Down no-space commands: /updownbtc5m, /updowneth15m, etc.
-bot.hears(/^\/updown(btc|eth)(5m|15m|60m)$/i, async (ctx) => {
+// Up/Down commands: /updownbtc5m, /updowneth15m, etc.
+bot.hears(/^\/updown(btc|eth)(5m|15m)$/i, async (ctx) => {
   const asset = String(ctx.match?.[1] ?? "").toLowerCase();
   const interval = String(ctx.match?.[2] ?? "").toLowerCase();
 
-  await ctx.reply(`🔎 Finding LIVE ${asset.toUpperCase()} Up/Down ${interval}...`);
+  await ctx.reply(`🔎 Resolving LIVE ${asset.toUpperCase()} Up/Down ${interval}...`);
 
   try {
     const out = await resolveUpDownMarketAndPrice({ asset, interval });
 
-    if (!out.found) {
-      // Show debug hints (what Gamma returned) so we can refine keywords
-      const lines = [
-        `❌ Up/Down not found.`,
-        `Asset: ${asset.toUpperCase()} | Interval: ${interval}`,
-      ];
-
-      if (out.debug?.queries?.length) {
-        lines.push("", "Tried search queries:");
-        for (const q of out.debug.queries) lines.push(`- ${q}`);
-      }
-
-      if (out.debug?.topTitles?.length) {
-        lines.push("", "Top matches Gamma returned (so we can adjust filters):");
-        for (const t of out.debug.topTitles.slice(0, 6)) lines.push(`- ${t}`);
-      }
-
-      await ctx.reply(lines.join("\n"));
+    if (!out?.found) {
+      await ctx.reply(
+        [
+          `❌ Up/Down not found.`,
+          `Asset: ${asset.toUpperCase()} | Interval: ${interval}`,
+          out?.reason ? `Reason: ${out.reason}` : "",
+        ].filter(Boolean).join("\n")
+      );
       return;
     }
 
@@ -214,22 +169,53 @@ bot.hears(/^\/updown(btc|eth)(5m|15m|60m)$/i, async (ctx) => {
     await ctx.reply(
       [
         `📈 *${out.title}*`,
+        `Slug: \`${out.slug}\``,
         "",
         `UP (mid): ${up}`,
         `DOWN (mid): ${down}`,
         "",
-        `_Source: Gamma discovery + CLOB midpoints_`,
+        `_Source: Gamma event-by-slug + CLOB midpoints_`,
       ].join("\n"),
       { parse_mode: "Markdown" }
     );
   } catch (e) {
     console.error("updown error:", e);
-    await ctx.reply("⚠️ Up/Down failed. Check Railway logs for details.");
+    await ctx.reply("⚠️ Up/Down failed. Check Railway logs.");
   }
 });
 
-// -------------
-// Start polling
-// -------------
-console.log("Bot running ✅ (polling)");
-bot.start();
+// --------------------
+// Start polling (WITH RETRY so Railway never “dies”)
+// --------------------
+async function startWithRetry() {
+  while (true) {
+    try {
+      console.log("Bot running ✅ (polling)");
+      await bot.start();
+      // If bot.start() ever returns, restart loop after a pause
+      console.warn("bot.start() returned unexpectedly, restarting...");
+      await sleep(2000);
+    } catch (err) {
+      const msg = String(err?.description || err?.message || err);
+
+      // This is the exact Telegram issue in your Railway logs
+      const is409 =
+        msg.includes("409") ||
+        msg.toLowerCase().includes("terminated by other getUpdates request") ||
+        msg.toLowerCase().includes("conflict");
+
+      console.error("Bot polling crashed:", err);
+
+      if (is409) {
+        console.warn("409 conflict detected. Waiting 6s then retrying...");
+        await sleep(6000);
+        continue;
+      }
+
+      console.warn("Non-409 error. Waiting 6s then retrying...");
+      await sleep(6000);
+    }
+  }
+}
+
+startWithRetry();

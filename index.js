@@ -1,143 +1,151 @@
-import { Bot, InlineKeyboard, GrammyError, HttpError } from "grammy";
-import { resolveUpDownMarketAndPrice } from "./src/polymarket.js";
+import { Bot } from "grammy";
+import express from "express";
+import fetch from "node-fetch";
 
-const TOKEN =
-  process.env.TELEGRAM_BOT_TOKEN ||
-  process.env.BOT_TOKEN; // fallback only (doesn't change your Railway setup)
+// ========== CONFIG ==========
+const BOT_TOKEN = process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
+const PORT = process.env.PORT || 3000;
 
-if (!TOKEN) {
-  console.error("❌ Missing TELEGRAM_BOT_TOKEN env var");
+if (!BOT_TOKEN) {
+  console.error("❌ BOT_TOKEN missing!");
   process.exit(1);
 }
 
-const bot = new Bot(TOKEN);
-
-// --------------------
-// Config (read-only)
-// --------------------
-const SIMULATION_ON = (process.env.SIMULATION ?? "true").toLowerCase() === "true";
-const SIM_CASH = Number(process.env.SIM_CASH ?? "50");
-const AI_ENABLED = (process.env.AI_ENABLED ?? "false").toLowerCase() === "true";
-const AI_MODEL = process.env.AI_MODEL ?? "unset";
-
-// --------------------
-// Helpers
-// --------------------
-function compactStatusText() {
-  return [
-    "📊 *Status*",
-    `Simulation: ${SIMULATION_ON ? "✅ ON" : "❌ OFF"}`,
-    `Sim cash: $${Number.isFinite(SIM_CASH) ? SIM_CASH : 0}`,
-    `AI: ${AI_ENABLED ? "✅ ON" : "❌ OFF"}`,
-    `AI model: \`${AI_MODEL}\``,
-  ].join("\n");
+// ========== LOGGING ==========
+function log(message, data = {}) {
+  const timestamp = new Date().toISOString();
+  console.log(JSON.stringify({ timestamp, message, ...data }));
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+// ========== BOT SETUP ==========
+const bot = new Bot(BOT_TOKEN);
+
+// ========== CLEAR WEBHOOK ==========
+async function setupBot() {
+  try {
+    log("Clearing webhook...");
+    await bot.api.deleteWebhook({ drop_pending_updates: true });
+    log("Webhook cleared");
+  } catch (error) {
+    log("Setup error", { error: error.message });
+  }
 }
 
-// --------------------
-// Commands (keep simple)
-// --------------------
+// ========== SLUG GENERATION ==========
+function getSlug(asset, interval) {
+  const now = Math.floor(Date.now() / 1000);
+  const seconds = interval === "5m" ? 300 : 900;
+  const rounded = Math.floor(now / seconds) * seconds;
+  return `${asset.toLowerCase()}-updown-${interval}-${rounded}`;
+}
+
+// ========== FETCH MARKET ==========
+async function getMarketData(slug) {
+  try {
+    log("Fetching", { slug });
+    
+    const eventRes = await fetch(`https://gamma-api.polymarket.com/events/slug/${slug}`);
+    if (!eventRes.ok) {
+      log("Not found", { slug });
+      return null;
+    }
+    
+    const event = await eventRes.json();
+    const markets = event.markets || [];
+    
+    const tokenIds = [];
+    for (const market of markets) {
+      if (market.clobTokenIds && market.clobTokenIds[0]) {
+        tokenIds.push(market.clobTokenIds[0]);
+      }
+    }
+    
+    if (tokenIds.length < 2) {
+      log("No token IDs");
+      return null;
+    }
+    
+    const priceRes = await fetch(`https://clob.polymarket.com/midpoints?token_ids=${tokenIds.join(",")}`);
+    const midpoints = await priceRes.json();
+    
+    return {
+      title: event.title || slug,
+      tokenIds,
+      midpoints
+    };
+  } catch (error) {
+    log("Error", { error: error.message });
+    return null;
+  }
+}
+
+// ========== COMMAND HANDLER ==========
+async function handleUpDown(ctx, asset, interval) {
+  const command = `/updown${asset}${interval}`;
+  log("Command", { command });
+  
+  await ctx.reply(`🔍 Looking up ${asset} ${interval}...`);
+  
+  const slug = getSlug(asset, interval);
+  const data = await getMarketData(slug);
+  
+  if (!data) {
+    await ctx.reply(`❌ ${asset} ${interval} not found. Try again in 10-20 seconds.`);
+    return;
+  }
+  
+  const upPrice = (data.midpoints[data.tokenIds[0]] * 100).toFixed(1);
+  const downPrice = (data.midpoints[data.tokenIds[1]] * 100).toFixed(1);
+  
+  const response = 
+    `${data.title}\n\n` +
+    `Slug: ${slug}\n\n` +
+    `UP (mid): ${upPrice}¢\n` +
+    `DOWN (mid): ${downPrice}¢\n\n` +
+    `Source: Gamma event-by-slug + CLOB midpoints`;
+  
+  log("Success", { asset, interval, up: upPrice, down: downPrice });
+  await ctx.reply(response);
+}
+
+// ========== COMMANDS ==========
 bot.command("ping", async (ctx) => {
-  await ctx.reply("pong ✅");
+  log("Ping");
+  await ctx.reply("pong");
 });
 
 bot.command("status", async (ctx) => {
-  const kb = new InlineKeyboard();
-  await ctx.reply(compactStatusText(), { parse_mode: "Markdown", reply_markup: kb });
+  log("Status");
+  await ctx.reply("🤖 Bot running\n\n✅ /updownbtc5m\n✅ /updownbtc15m\n✅ /updowneth5m\n✅ /updowneth15m");
 });
 
-// --------------------
-// UP / DOWN (unchanged logic call)
-// --------------------
-bot.hears(/^\/updown(btc|eth)(5m|15m)$/i, async (ctx) => {
-  const asset = String(ctx.match?.[1] ?? "").toLowerCase();
-  const interval = String(ctx.match?.[2] ?? "").toLowerCase();
+bot.command("updownbtc5m", async (ctx) => handleUpDown(ctx, "BTC", "5m"));
+bot.command("updownbtc15m", async (ctx) => handleUpDown(ctx, "BTC", "15m"));
+bot.command("updowneth5m", async (ctx) => handleUpDown(ctx, "ETH", "5m"));
+bot.command("updowneth15m", async (ctx) => handleUpDown(ctx, "ETH", "15m"));
 
-  await ctx.reply(`🔎 Fetching LIVE ${asset.toUpperCase()} ${interval} market...`);
+// ========== ERROR HANDLING ==========
+bot.catch((err) => log("Bot error", { error: err.message }));
 
-  try {
-    const result = await resolveUpDownMarketAndPrice({ asset, interval });
+// ========== EXPRESS SERVER ==========
+const app = express();
+app.get("/", (req, res) => res.send("AIBINGWA Bot Running"));
 
-    if (!result || !result.found) {
-      await ctx.reply(`❌ Up/Down not found.\nAsset: ${asset.toUpperCase()} | Interval: ${interval}`);
-      return;
-    }
-
-    const up = result.upMid != null ? `${Math.round(result.upMid * 100)}¢` : "—";
-    const down = result.downMid != null ? `${Math.round(result.downMid * 100)}¢` : "—";
-
-    await ctx.reply(
-      [`📈 *${result.title}*`, "", `UP (mid): ${up}`, `DOWN (mid): ${down}`, "", `_Source: Gamma + CLOB_`].join("\n"),
-      { parse_mode: "Markdown" }
-    );
-  } catch (err) {
-    console.error("🔥 ERROR in /updown handler:", err);
-    await ctx.reply("⚠️ Up/Down failed. Check Railway logs.");
-  }
+const server = app.listen(PORT, () => {
+  log(`Server on port ${PORT}`);
 });
 
-// --------------------
-// Global error log (doesn't crash the process)
-// --------------------
-bot.catch((err) => {
-  const e = err.error;
-  if (e instanceof GrammyError) {
-    console.error("GrammyError:", e.description);
-  } else if (e instanceof HttpError) {
-    console.error("HttpError contacting Telegram:", e);
-  } else {
-    console.error("Unknown error:", e);
-  }
+// ========== START BOT ==========
+setupBot().then(() => {
+  bot.start({ onStart: (info) => log(`Bot started as @${info.username}`) });
 });
 
-// --------------------
-// Railway-safe polling loop (fixes 409 loops)
-// --------------------
-async function startPollingForever() {
-  // Clean start: ensure webhook is off + drop backlog
-  try {
-    await bot.api.deleteWebhook({ drop_pending_updates: true });
-    console.log("✅ Webhook cleared, pending updates dropped.");
-  } catch (e) {
-    console.log("⚠️ deleteWebhook failed (continuing):", e?.message ?? e);
-  }
-
-  // If Telegram returns 409 due to overlap, retry instead of crashing
-  // Backoff grows a bit to reduce thrashing during deploy overlaps
-  let backoffMs = 2500;
-
-  while (true) {
-    try {
-      console.log("🤖 Bot running ✅ (polling)");
-      await bot.start({
-        allowed_updates: ["message", "callback_query"],
-      });
-
-      // bot.start only returns when stopped
-      console.log("🛑 Bot stopped. Restarting polling in 2s...");
-      await sleep(2000);
-    } catch (e) {
-      const msg = String(e?.description ?? e?.message ?? e);
-
-      if (msg.includes("terminated by other getUpdates request") || msg.includes("409")) {
-        console.warn(`⚠️ Telegram 409 conflict. Retrying in ${Math.round(backoffMs / 1000)}s...`);
-        await sleep(backoffMs);
-        backoffMs = Math.min(backoffMs + 1500, 12000);
-        continue;
-      }
-
-      console.error("🔥 Polling crashed with non-409 error:", e);
-      // Give it a short cooldown then retry anyway (keeps bot alive)
-      await sleep(5000);
-    }
-  }
+// ========== GRACEFUL SHUTDOWN ==========
+async function shutdown(signal) {
+  log(`Shutdown: ${signal}`);
+  await bot.stop();
+  server.close(() => process.exit(0));
 }
 
-// Graceful shutdown (helps Railway handover)
-process.once("SIGINT", () => bot.stop());
-process.once("SIGTERM", () => bot.stop());
-
-startPollingForever();
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));

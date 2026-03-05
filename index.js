@@ -1,7 +1,6 @@
 import { Bot } from "grammy";
 import { resolveUpDownMarketAndPrice } from "./src/polymarket.js";
 
-// Accept either env var name
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN;
 
 if (!TOKEN) {
@@ -21,9 +20,11 @@ bot.command("ping", async (ctx) => {
 
 bot.command("status", async (ctx) => {
   console.log(`[JOURNAL] /status requested`);
+
   await ctx.reply(
     [
       "📊 Status",
+      "Build: deploy-check-v1",
       `Simulation: ${(process.env.SIMULATION ?? "true").toLowerCase() === "true" ? "✅ ON" : "❌ OFF"}`,
       `Sim cash: $${Number(process.env.SIM_CASH ?? "50")}`,
       `AI: ${(process.env.AI_ENABLED ?? "false").toLowerCase() === "true" ? "✅ ON" : "❌ OFF"}`,
@@ -34,11 +35,11 @@ bot.command("status", async (ctx) => {
   );
 });
 
-// No-space Up/Down commands: /updownbtc5m etc.
+// Up/Down commands
 bot.hears(/^\/updown(btc|eth)(5m|15m)$/i, async (ctx) => {
   const asset = String(ctx.match[1] ?? "").toLowerCase();
   const interval = String(ctx.match[2] ?? "").toLowerCase();
-  
+
   console.log(`[JOURNAL] Command: /updown${asset}${interval} | User: ${ctx.from?.username}`);
 
   await ctx.reply(`🔎 Resolving LIVE ${asset.toUpperCase()} Up/Down ${interval}...`);
@@ -48,11 +49,9 @@ bot.hears(/^\/updown(btc|eth)(5m|15m)$/i, async (ctx) => {
 
     if (!out || !out.found) {
       console.warn(`[JOURNAL] Result: NOT_FOUND | Asset: ${asset} | Interval: ${interval}`);
-      await ctx.reply(`❌ Up/Down not found.\nAsset: ${asset.toUpperCase()} | Interval: ${interval}\n\nTip: Polymarket indexing often delays 30s. Try again.`);
+      await ctx.reply(`❌ Up/Down not found.\nAsset: ${asset.toUpperCase()} | Interval: ${interval}`);
       return;
     }
-
-    console.log(`[JOURNAL] Result: SUCCESS | Slug: ${out.slug}`);
 
     const up = out.upMid != null ? `${Math.round(out.upMid * 100)}¢` : "—";
     const down = out.downMid != null ? `${Math.round(out.downMid * 100)}¢` : "—";
@@ -60,12 +59,11 @@ bot.hears(/^\/updown(btc|eth)(5m|15m)$/i, async (ctx) => {
     await ctx.reply(
       [
         `📈 ${out.title}`,
-        `Slug: ${out.slug ?? "—"}`,
         "",
         `UP (mid): ${up}`,
         `DOWN (mid): ${down}`,
         "",
-        "Source: Gamma event-by-slug + CLOB midpoints",
+        "Source: Gamma + CLOB",
       ].join("\n")
     );
   } catch (e) {
@@ -75,17 +73,16 @@ bot.hears(/^\/updown(btc|eth)(5m|15m)$/i, async (ctx) => {
 });
 
 // --------------------
-// Clean start + graceful stop (Railway-safe)
+// Railway safe startup
 // --------------------
 async function start() {
   try {
-    // This removes the "409 Conflict" by clearing old sessions
     await bot.api.deleteWebhook({ drop_pending_updates: true });
-    console.log("🤖 [JOURNAL] Webhook cleared. Starting polling...");
-    
+    console.log("🤖 Webhook cleared");
+
     bot.start({
       onStart: (botInfo) => {
-        console.log(`🤖 [JOURNAL] Bot @${botInfo.username} is ONLINE ✅`);
+        console.log(`🤖 Bot @${botInfo.username} ONLINE`);
       },
     });
   } catch (e) {
@@ -95,14 +92,13 @@ async function start() {
 }
 
 process.once("SIGTERM", () => {
-  console.log("🛑 SIGTERM: Stopping bot...");
+  console.log("Stopping bot...");
   bot.stop();
 });
 
 process.once("SIGINT", () => {
-  console.log("🛑 SIGINT: Stopping bot...");
+  console.log("Stopping bot...");
   bot.stop();
 });
 
 start();
-

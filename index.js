@@ -82,14 +82,11 @@ bot.catch((err) => {
   console.error('Bot error:', err);
 });
 
-// Start the Telegram bot (polling)
-bot.start();
-
-// ==================== EXPRESS API (PRICE ORACLE) ====================
+// ==================== PRICE ORACLE API ====================
 const app = express();
 
 app.get('/api/price/:asset/:interval', async (req, res) => {
-  const { asset, interval } = req.params; // e.g., btc, 5m
+  const { asset, interval } = req.params;
   if (!['btc', 'eth'].includes(asset) || !['5m', '15m'].includes(interval)) {
     return res.status(400).json({ error: 'Invalid asset or interval' });
   }
@@ -116,5 +113,8 @@ app.get('/api/price/:asset/:interval', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Price oracle API running on port ${PORT}`);
+  console.log(`📡 Price oracle API running on port ${PORT}`);
 });
+
+// Start the Telegram bot
+bot.start().catch(console.error);

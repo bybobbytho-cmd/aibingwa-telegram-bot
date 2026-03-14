@@ -2,7 +2,8 @@ const { Bot } = require('grammy');
 const express = require('express');
 const { resolveUpDownMarketAndPrice } = require('./src/polymarket');
 
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+// Use the correct environment variable name
+const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const PORT = process.env.PORT || 3000;
 
 // ==================== TELEGRAM BOT ====================

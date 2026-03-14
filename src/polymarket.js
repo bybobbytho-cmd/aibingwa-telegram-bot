@@ -71,8 +71,8 @@ function candidateWindowStarts(sec) {
  * 2) If 400, try POST /midpoints with JSON body
  * 3) If still failing, fall back to GET /midpoint per token
  *
- * Docs: GET /midpoints and POST /midpoints :contentReference[oaicite:2]{index=2}
- * Docs: GET /midpoint :contentReference[oaicite:3]{index=3}
+ * Docs: GET /midpoints and POST /midpoints
+ * Docs: GET /midpoint
  */
 async function clobMidpoints(tokenIds) {
   const ids = tokenIds.filter(Boolean).map(String);
@@ -135,8 +135,9 @@ export async function resolveUpDownMarketAndPrice({ asset, interval }) {
       if (!event) continue;
 
       const tokenIds = extractTokenIdsFromEvent(event);
-      // ADDED LOGGING LINE:
-      console.log('🎯 Token IDs for', slug, ':', JSON.stringify(tokenIds));
+      
+      // 🔥 TEMPORARY LOG LINE – REMOVE AFTER CAPTURING IDS
+      console.log('TOKEN_IDS:', JSON.stringify(tokenIds));
 
       if (tokenIds.length < 2) {
         errors.push({ slug, error: "insufficient token IDs" });
@@ -145,7 +146,6 @@ export async function resolveUpDownMarketAndPrice({ asset, interval }) {
 
       const mids = await clobMidpoints(tokenIds);
 
-      // mids may map tokenId -> "0.45" (string) per docs
       const upRaw = mids?.[tokenIds[0]] ?? null;
       const downRaw = mids?.[tokenIds[1]] ?? null;
 

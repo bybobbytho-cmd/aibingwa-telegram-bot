@@ -2,7 +2,6 @@ const { Bot } = require('grammy');
 const express = require('express');
 const { resolveUpDownMarketAndPrice } = require('./src/polymarket');
 
-// Use the correct environment variable name
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const PORT = process.env.PORT || 3000;
 
@@ -83,7 +82,7 @@ bot.catch((err) => {
   console.error('Bot error:', err);
 });
 
-// ==================== PRICE ORACLE API ====================
+// ==================== PRICE API ====================
 const app = express();
 
 app.get('/api/price/:asset/:interval', async (req, res) => {
@@ -114,7 +113,7 @@ app.get('/api/price/:asset/:interval', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`📡 Price oracle API running on port ${PORT}`);
+  console.log(`📡 Price API running on port ${PORT}`);
 });
 
 // Start the Telegram bot

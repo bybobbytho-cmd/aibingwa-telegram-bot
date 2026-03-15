@@ -7,8 +7,8 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "grammy": "^1.19.0",
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "grammy": "^1.19.0"
   },
   "keywords": [],
   "author": "",

@@ -1,23 +1,19 @@
+// index.js
+require('dotenv').config();
 const { Bot } = require('grammy');
 const express = require('express');
 const { resolveUpDownMarketAndPrice } = require('./src/polymarket');
 
-const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+if (!BOT_TOKEN) {
+  console.error('Missing TELEGRAM_BOT_TOKEN');
+  process.exit(1);
+}
+
+const bot = new Bot(BOT_TOKEN);
 const PORT = process.env.PORT || 3000;
 
-// ==================== TELEGRAM BOT ====================
-const bot = new Bot(TELEGRAM_TOKEN);
-
-bot.command('start', (ctx) => ctx.reply(
-  '🤖 *Polymarket Price Bot*\n\n' +
-  'Commands:\n' +
-  '/updownbtc5m – BTC 5m prices\n' +
-  '/updownbtc15m – BTC 15m prices\n' +
-  '/updowneth5m – ETH 5m prices\n' +
-  '/updowneth15m – ETH 15m prices',
-  { parse_mode: 'Markdown' }
-));
-
+// Telegram commands (only 5m and 15m – you can add 60m later if you want)
 bot.command('updownbtc5m', async (ctx) => {
   const result = await resolveUpDownMarketAndPrice({ asset: 'btc', interval: '5m' });
   if (result.found) {
@@ -87,7 +83,8 @@ const app = express();
 
 app.get('/api/price/:asset/:interval', async (req, res) => {
   const { asset, interval } = req.params;
-  if (!['btc', 'eth'].includes(asset) || !['5m', '15m'].includes(interval)) {
+  // Allow 5m, 15m, and 60m intervals
+  if (!['btc', 'eth'].includes(asset) || !['5m', '15m', '60m'].includes(interval)) {
     return res.status(400).json({ error: 'Invalid asset or interval' });
   }
 
@@ -116,5 +113,4 @@ app.listen(PORT, () => {
   console.log(`📡 Price API running on port ${PORT}`);
 });
 
-// Start the Telegram bot
 bot.start().catch(console.error);
